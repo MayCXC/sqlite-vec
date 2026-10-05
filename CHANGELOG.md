@@ -12,6 +12,15 @@ All notable changes to this community fork will be documented in this file.
   - Cosine distances of ordinary float32 vectors can differ from previous releases in the last few significant digits, as they are now correctly rounded
 - **`NPY_MAGIC` initialiser no longer relies on dropping the string terminator** (upstream [#321](https://github.com/asg017/sqlite-vec/issues/321)) - fixes `-Wunterminated-string-initialization` on newer GCC and Clang, and a hard error when compiled as C++
 
+### Changed
+
+- **`xShadowName` now reports `vector_chunksNN` tables** (upstream [#320](https://github.com/asg017/sqlite-vec/issues/320)) - a partial improvement, not a complete fix
+  - SQLite matches a newly created table to its virtual table by splitting the name at the last underscore, which the `vector_chunksNN` suffix defeats, so SQLite only learns that these are shadow tables in the cases below
+  - SQLite 3.53 and earlier: they are listed as `shadow` by `PRAGMA table_list`, and write-protected under `SQLITE_DBCONFIG_DEFENSIVE`, only once the database has been VACUUMed. A vec0 table created after that VACUUM is not covered until the next one
+  - SQLite 3.54 (unreleased at the time of writing) is expected to recognise them in every new connection, without a VACUUM, though still not in the connection that created the table
+  - Once they are recognised, scripts that write to or drop a `vector_chunksNN` table directly are refused in defensive mode, as they already are for the other backing tables
+  - Tools should keep identifying vec0 backing tables by name instead of relying on `type = 'shadow'`
+
 ## [0.2.6-alpha] - 2026-08-22
 
 ### Added
