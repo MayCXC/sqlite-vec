@@ -221,8 +221,10 @@ test-snapshots-update: loadable
 test-loadable-watch:
 	watchexec --exts c,py,Makefile --clear -- make test-loadable
 
-test-unit:
-	$(CC) tests/test-unit.c sqlite-vec.c -I./ -Ivendor -o $(prefix)/test-unit && $(prefix)/test-unit
+# Links SQLite itself: without SQLITE_CORE the sqlite3_* calls in sqlite-vec.c
+# go through the extension API pointer, which is NULL outside a loaded extension.
+test-unit: $(prefix)
+	$(CC) -DSQLITE_CORE tests/test-unit.c sqlite-vec.c vendor/sqlite3.c -I./ -Ivendor -o $(prefix)/test-unit -ldl -lm && $(prefix)/test-unit
 
 site-dev:
 	npm --prefix site run dev
