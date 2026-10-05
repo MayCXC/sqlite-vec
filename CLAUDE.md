@@ -61,7 +61,8 @@ make test-loadable-watch
 
 **Other tests:**
 - `make test` - Run basic SQL tests via `test.sql`
-- `make test-unit` - Compile and run C unit tests
+- `make test-unit` - Compile and run C unit tests (`tests/test-unit.c`)
+- `cargo test --manifest-path tests/Cargo.toml` - Rust harness for internal C functions (`tests/unittest.rs`)
 - `sqlite3 :memory: '.read test.sql'` - Quick smoke test
 
 **Test structure:**

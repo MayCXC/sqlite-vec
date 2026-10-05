@@ -23,6 +23,7 @@ jobs:
           path: dist/*
       # after the upload, so dist/test-unit stays out of the artifact
       - run: make test-unit
+      - run: cargo test --locked --manifest-path tests/Cargo.toml
   build-macos-x86_64-extension:
     runs-on: macos-15-intel
     steps:
