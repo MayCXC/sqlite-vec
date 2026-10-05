@@ -115,7 +115,7 @@ jobs:
         with:
           java-version: "17"
           distribution: "temurin"
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v4
       - run: |
           sdkmanager --install "ndk;27.0.12077973"
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.0.12077973" >> $GITHUB_ENV
