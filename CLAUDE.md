@@ -178,6 +178,20 @@ Users install directly from GitHub using version tags.
 **Original release process (for reference only):**
 The original repository uses `./scripts/publish-release.sh` and CI/CD (`.github/workflows/release.yaml`) to build and publish platform-specific extensions and language packages.
 
+**Future work: `.github/workflows/release.yaml`**
+
+The Release workflow has never run on this fork (it triggers on a published GitHub release, and the fork only pushes tags) and cannot complete a run as it stands. As of v0.2.7-alpha:
+
+- It has drifted from `test.yaml`, where these are already fixed:
+  - `android-actions/setup-android@v3` should be `@v4` (v3 installs the removed `tools` SDK package and fails during setup)
+  - `runs-on: macos-13` should be `macos-15-intel` (retired runner)
+  - `runs-on: windows-2019` should be `windows-2022` (retired runner)
+  - the `ncruces/go-sqlite3` checkout should be pinned with `ref: v0.30.5` (the patch does not apply to later layouts)
+- The `dist` and `upload-crate` jobs publish to npm, RubyGems, PyPI and crates.io under upstream's package names, using secrets the fork does not have, and `build-ncruces-go` pushes to another repository with a personal access token.
+- `actions/setup-node@v3` and `actions-rs/toolchain@v1` have not been checked and may also be stale.
+
+Options, not yet decided: sync the four lines and keep it as a reference copy; trim it to build the extensions and attach them to a GitHub release (dropping the registry and ncruces jobs), which would give users prebuilt binaries; or make it manual-only or delete it. Nothing in it can be tested without publishing a release.
+
 ### Working with Tests
 
 **Python test fixtures:**
