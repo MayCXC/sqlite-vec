@@ -586,13 +586,17 @@ static f32 distance_cosine_float(const void *pVect1v, const void *pVect2v,
   f32 *pVect2 = (f32 *)pVect2v;
   size_t qty = *((size_t *)qty_ptr);
 
-  f32 dot = 0;
-  f32 aMag = 0;
-  f32 bMag = 0;
+  // Accumulate in double: the square of a small (or large) f32 element
+  // underflows (or overflows) f32, which made the magnitude 0 (or Inf) and
+  // the distance +-Inf, NaN or plain wrong for nonzero finite vectors. Every
+  // f32 product is representable in double.
+  double dot = 0;
+  double aMag = 0;
+  double bMag = 0;
   for (size_t i = 0; i < qty; i++) {
-    dot += *pVect1 * *pVect2;
-    aMag += *pVect1 * *pVect1;
-    bMag += *pVect2 * *pVect2;
+    dot += (double)*pVect1 * (double)*pVect2;
+    aMag += (double)*pVect1 * (double)*pVect1;
+    bMag += (double)*pVect2 * (double)*pVect2;
     pVect1++;
     pVect2++;
   }
@@ -2054,12 +2058,14 @@ static void vec_normalize(sqlite3_context *context, int argc,
 
   f32 *v = (f32 *)vector;
 
-  f32 norm = 0;
+  // Accumulate in double so that squaring small or large f32 elements does
+  // not underflow or overflow, see distance_cosine_float().
+  double norm = 0;
   for (size_t i = 0; i < dimensions; i++) {
-    norm += v[i] * v[i];
+    norm += (double)v[i] * (double)v[i];
   }
   norm = sqrt(norm);
-  if (norm == 0.0f) {
+  if (norm == 0.0) {
     // A zero-magnitude vector cannot be normalized. Return NULL instead of
     // producing a vector of NaNs.
     sqlite3_free(out);
