@@ -10,6 +10,7 @@ All notable changes to this community fork will be documented in this file.
   - Squared magnitudes were accumulated in float32, so elements below roughly 3e-23 underflowed to a zero magnitude and elements above roughly 2e19 overflowed to Inf (giving a distance of 1.0 whatever the direction). In a cosine `vec0` table the affected rows ranked ahead of (or behind) the true nearest neighbours
   - `vec_distance_cosine()`, cosine KNN queries and MMR reranking now accumulate in double precision, as does `vec_normalize()`, which returned NULL, a zero vector or a non-unit vector for the same inputs
   - Cosine distances of ordinary float32 vectors can differ from previous releases in the last few significant digits, as they are now correctly rounded
+- **`NPY_MAGIC` initialiser no longer relies on dropping the string terminator** (upstream [#321](https://github.com/asg017/sqlite-vec/issues/321)) - fixes `-Wunterminated-string-initialization` on newer GCC and Clang, and a hard error when compiled as C++
 
 ## [0.2.6-alpha] - 2026-08-22
 
