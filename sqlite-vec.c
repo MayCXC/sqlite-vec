@@ -5869,6 +5869,41 @@ static int vec0_rowids_from_id_collated(vec0_vtab *p, sqlite3_value *valueId,
   return rc == SQLITE_DONE ? SQLITE_OK : rc;
 }
 
+/**
+ * Whether a KNN query takes constraint i itself, as an argument or as a filter
+ * applied before its k: a MATCH on a vector column, `k` and the hidden
+ * parameter columns declared after it (`mmr_lambda` among them), a
+ * `rowid in (...)`, and any constraint on a partition key, metadata or distance
+ * column. LIMIT and OFFSET are SQLite's own and never one of them.
+ */
+static int vec0_knn_takes_constraint(vec0_vtab *p, sqlite3_index_info *pIdxInfo,
+                                     int i) {
+  int iColumn = pIdxInfo->aConstraint[i].iColumn;
+  int op = pIdxInfo->aConstraint[i].op;
+  if (op == SQLITE_INDEX_CONSTRAINT_LIMIT ||
+      op == SQLITE_INDEX_CONSTRAINT_OFFSET) {
+    return 0;
+  }
+  if (op == SQLITE_INDEX_CONSTRAINT_MATCH) {
+    return vec0_column_idx_is_vector(p, iColumn);
+  }
+  if (iColumn >= vec0_column_k_idx(p)) {
+    return op == SQLITE_INDEX_CONSTRAINT_EQ;
+  }
+  if (iColumn == VEC0_COLUMN_ID) {
+#if COMPILER_SUPPORTS_VTAB_IN
+    return op == SQLITE_INDEX_CONSTRAINT_EQ &&
+           sqlite3_libversion_number() >= 3038000 &&
+           sqlite3_vtab_in(pIdxInfo, i, -1);
+#else
+    return 0;
+#endif
+  }
+  return vec0_column_idx_is_partition(p, iColumn) ||
+         vec0_column_idx_is_metadata(p, iColumn) ||
+         iColumn == vec0_column_distance_idx(p);
+}
+
 static int vec0BestIndex(sqlite3_vtab *pVTab, sqlite3_index_info *pIdxInfo) {
   vec0_vtab *p = (vec0_vtab *)pVTab;
   /**
@@ -5897,6 +5932,26 @@ static int vec0BestIndex(sqlite3_vtab *pVTab, sqlite3_index_info *pIdxInfo) {
 #ifdef SQLITE_VEC_DEBUG
   printf("pIdxInfo->nOrderBy=%d, pIdxInfo->nConstraint=%d\n", pIdxInfo->nOrderBy, pIdxInfo->nConstraint);
 #endif
+
+  // A KNN query takes its query vector, its k and its filters itself: SQLite
+  // applying a filter to the k rows afterwards would keep only whichever of the
+  // overall k nearest pass it. When one of them reads another table of the
+  // query, SQLite also weighs plans that have not reached that table yet, in
+  // which the constraint is unusable, so such a plan is refused, the way
+  // json_each refuses a plan that cannot supply its argument, and the planner
+  // takes one in which vec0 is given every constraint the KNN takes.
+  for (int i = 0; i < pIdxInfo->nConstraint; i++) {
+    if (pIdxInfo->aConstraint[i].op == SQLITE_INDEX_CONSTRAINT_MATCH &&
+        vec0_column_idx_is_vector(p, pIdxInfo->aConstraint[i].iColumn)) {
+      for (int j = 0; j < pIdxInfo->nConstraint; j++) {
+        if (!pIdxInfo->aConstraint[j].usable &&
+            vec0_knn_takes_constraint(p, pIdxInfo, j)) {
+          return SQLITE_CONSTRAINT;
+        }
+      }
+      break;
+    }
+  }
 
   for (int i = 0; i < pIdxInfo->nConstraint; i++) {
     u8 vtabIn = 0;
