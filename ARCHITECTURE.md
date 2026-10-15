@@ -190,6 +190,24 @@ metadata column KNN filters.
 
 The foruth character of the block is a `_` filler.
 
+#### `VEC0_IDXSTR_KIND_KNN_ROCCHIO` (`'@'`)
+
+`argv[i]` is the value of the hidden `rocchio` column in a KNN query: the rowid,
+or the id for a table with a text primary key, of a row judged relevant. The
+query vector moves toward that row's vector before the search runs,
+`q' = q + rocchio_beta * r`, and every distance the query reports is to `q'`. A
+NULL value leaves the query vector as given. Only `float32` vector columns take
+feedback.
+
+The remaining 3 characters of the block are `_` fillers.
+
+#### `VEC0_IDXSTR_KIND_KNN_ROCCHIO_BETA` (`'$'`)
+
+`argv[i]` is the value of the hidden `rocchio_beta` column, the weight of the
+feedback row's vector. It defaults to 0.75 when only `rocchio` is given.
+
+The remaining 3 characters of the block are `_` fillers.
+
 #### `VEC0_IDXSTR_KIND_KNN_DISTANCE_CONSTRAINT` (`'*'`)
 
 `argv[i]` is a constraint on the `distance` column in a KNN query.
