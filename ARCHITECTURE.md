@@ -137,8 +137,9 @@ is associated with `argv[0]`. The 2nd block at byte offset `5-8` (inclusive) is
 associated with `argv[1]` and so on. Each block describes what kind of value or
 filter the given `argv[i]` value is.
 
-A KNN plan needs its arguments: the MATCH on a vector column, `k`, and
-`mmr_lambda`. When one of them reads another table of the query, SQLite also
+A KNN plan needs its arguments: the MATCH on a vector column, `k`,
+`mmr_lambda`, `rocchio`, and `rocchio_beta`. When one of them reads another
+table of the query, SQLite also
 weighs plans that scan `vec0` before that table, in which the argument is
 unusable. `xBestIndex` returns `SQLITE_CONSTRAINT` for such a plan
 (`vec0_constraint_is_knn_argument`), so the planner takes one that gives `vec0`
@@ -338,5 +339,23 @@ a blob, or text such as `'abc'` fails. It converts the number to `f32` and
 fails the query if it is below 0.0 or above 1.0. For a value below 1.0, it
 fetches the `k * 5` nearest rows (at most 4096) and, if it finds more than
 `k`, selects `k` of them by MMR.
+
+The remaining 3 characters of the block are `_` fillers.
+
+#### `VEC0_IDXSTR_KIND_KNN_ROCCHIO` (`'@'`)
+
+`argv[i]` is the value of the hidden `rocchio` column in a KNN query: the rowid,
+or the id for a table with a text primary key, of a row judged relevant. The
+query vector moves toward that row's vector before the search runs,
+`q' = q + rocchio_beta * r`, and every distance the query reports is to `q'`. A
+NULL value leaves the query vector as given. Only `float32` vector columns take
+feedback.
+
+The remaining 3 characters of the block are `_` fillers.
+
+#### `VEC0_IDXSTR_KIND_KNN_ROCCHIO_BETA` (`'$'`)
+
+`argv[i]` is the value of the hidden `rocchio_beta` column, the weight of the
+feedback row's vector. It defaults to 0.75 when only `rocchio` is given.
 
 The remaining 3 characters of the block are `_` fillers.

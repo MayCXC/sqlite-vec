@@ -3730,6 +3730,8 @@ static sqlite3_module vec_npy_eachModule = {
 #define VEC0_COLUMN_OFFSET_K 2
 #define VEC0_COLUMN_OFFSET_TABLE_NAME 3
 #define VEC0_COLUMN_OFFSET_MMR_LAMBDA 4
+#define VEC0_COLUMN_OFFSET_ROCCHIO 5
+#define VEC0_COLUMN_OFFSET_ROCCHIO_BETA 6
 
 #define VEC0_SHADOW_INFO_NAME "\"%w\".\"%w_info\""
 
@@ -4046,6 +4048,24 @@ int vec0_column_table_name_idx(vec0_vtab *p) {
 int vec0_column_mmr_lambda_idx(vec0_vtab *p) {
   return VEC0_COLUMN_USERN_START + (vec0_num_defined_user_columns(p) - 1) +
          VEC0_COLUMN_OFFSET_MMR_LAMBDA - (p->hasCommandColumn ? 0 : 1);
+}
+
+/**
+ * Returns the column index for the hidden "rocchio" column, the id of the row
+ * whose vector is relevance feedback for a KNN query. It follows mmr_lambda.
+ */
+int vec0_column_rocchio_idx(vec0_vtab *p) {
+  return VEC0_COLUMN_USERN_START + (vec0_num_defined_user_columns(p) - 1) +
+         VEC0_COLUMN_OFFSET_ROCCHIO - (p->hasCommandColumn ? 0 : 1);
+}
+
+/**
+ * Returns the column index for the hidden "rocchio_beta" column, the weight of
+ * the feedback vector. It follows rocchio.
+ */
+int vec0_column_rocchio_beta_idx(vec0_vtab *p) {
+  return VEC0_COLUMN_USERN_START + (vec0_num_defined_user_columns(p) - 1) +
+         VEC0_COLUMN_OFFSET_ROCCHIO_BETA - (p->hasCommandColumn ? 0 : 1);
 }
 
 /**
@@ -5429,7 +5449,9 @@ static int vec0_init(sqlite3 *db, void *pAux, int argc, const char *const *argv,
   }
   if (sqlite3_stricmp(tableName, "distance") == 0 ||
       sqlite3_stricmp(tableName, "k") == 0 ||
-      sqlite3_stricmp(tableName, "mmr_lambda") == 0) {
+      sqlite3_stricmp(tableName, "mmr_lambda") == 0 ||
+      sqlite3_stricmp(tableName, "rocchio") == 0 ||
+      sqlite3_stricmp(tableName, "rocchio_beta") == 0) {
     hasCommandColumn = 0;
   }
   if (isCreate && !hasCommandColumn) {
@@ -5445,7 +5467,8 @@ static int vec0_init(sqlite3 *db, void *pAux, int argc, const char *const *argv,
   if (hasCommandColumn) {
     sqlite3_str_appendf(createStr, "\"%w\" hidden, ", tableName);
   }
-  sqlite3_str_appendall(createStr, "mmr_lambda hidden) ");
+  sqlite3_str_appendall(
+      createStr, "mmr_lambda hidden, rocchio hidden, rocchio_beta hidden) ");
   if (pkColumnName) {
     sqlite3_str_appendall(createStr, "without rowid ");
   }
@@ -5880,6 +5903,13 @@ typedef enum {
   // ~~~ KNN QUERIES, continued ~~~ //
   VEC0_IDXSTR_KIND_METADATA_CONSTRAINT = '&',
   VEC0_IDXSTR_KIND_KNN_MMR_LAMBDA = '#',
+
+  // argv[i] is the id of the row whose vector is relevance feedback for a KNN
+  // query
+  VEC0_IDXSTR_KIND_KNN_ROCCHIO = '@',
+
+  // argv[i] is the weight of the relevance feedback vector in a KNN query
+  VEC0_IDXSTR_KIND_KNN_ROCCHIO_BETA = '$',
 } vec0_idxstr_kind;
 
 // The different SQLITE_INDEX_CONSTRAINT values that vec0 partition key columns
@@ -5951,9 +5981,9 @@ typedef enum {
 
 /**
  * Whether constraint i is an argument of a KNN query: a MATCH on a vector
- * column, `k = ?`, or `mmr_lambda = ?`. Filters are not refused;
- * ARCHITECTURE.md's idxStr section says why, and when a filter whose value
- * comes from another table applies before the k anyway.
+ * column, `k = ?`, `mmr_lambda = ?`, `rocchio = ?`, or `rocchio_beta = ?`.
+ * Filters are not refused; ARCHITECTURE.md's idxStr section says why, and when
+ * a filter whose value comes from another table applies before the k anyway.
  */
 static int vec0_constraint_is_knn_argument(vec0_vtab *p,
                                            sqlite3_index_info *pIdxInfo,
@@ -5965,7 +5995,9 @@ static int vec0_constraint_is_knn_argument(vec0_vtab *p,
   }
   return op == SQLITE_INDEX_CONSTRAINT_EQ &&
          (iColumn == vec0_column_k_idx(p) ||
-          iColumn == vec0_column_mmr_lambda_idx(p));
+          iColumn == vec0_column_mmr_lambda_idx(p) ||
+          iColumn == vec0_column_rocchio_idx(p) ||
+          iColumn == vec0_column_rocchio_beta_idx(p));
 }
 
 static int vec0BestIndex(sqlite3_vtab *pVTab, sqlite3_index_info *pIdxInfo) {
@@ -5988,6 +6020,8 @@ static int vec0BestIndex(sqlite3_vtab *pVTab, sqlite3_index_info *pIdxInfo) {
   int iRowidTerm = -1;
   int iKTerm = -1;
   int iMmrLambdaTerm = -1;
+  int iRocchioTerm = -1;
+  int iRocchioBetaTerm = -1;
   int iRowidInTerm = -1;
   int hasAuxConstraint = 0;
 
@@ -6065,6 +6099,14 @@ static int vec0BestIndex(sqlite3_vtab *pVTab, sqlite3_index_info *pIdxInfo) {
     if (op == SQLITE_INDEX_CONSTRAINT_EQ &&
         iColumn == vec0_column_mmr_lambda_idx(p)) {
       iMmrLambdaTerm = i;
+    }
+    if (op == SQLITE_INDEX_CONSTRAINT_EQ &&
+        iColumn == vec0_column_rocchio_idx(p)) {
+      iRocchioTerm = i;
+    }
+    if (op == SQLITE_INDEX_CONSTRAINT_EQ &&
+        iColumn == vec0_column_rocchio_beta_idx(p)) {
+      iRocchioBetaTerm = i;
     }
     if ((op != SQLITE_INDEX_CONSTRAINT_LIMIT &&
          op != SQLITE_INDEX_CONSTRAINT_OFFSET) &&
@@ -6514,6 +6556,20 @@ static int vec0BestIndex(sqlite3_vtab *pVTab, sqlite3_index_info *pIdxInfo) {
       pIdxInfo->aConstraintUsage[iMmrLambdaTerm].argvIndex = argvIndex++;
       pIdxInfo->aConstraintUsage[iMmrLambdaTerm].omit = 1;
       sqlite3_str_appendchar(idxStr, 1, VEC0_IDXSTR_KIND_KNN_MMR_LAMBDA);
+      sqlite3_str_appendchar(idxStr, 3, '_');
+    }
+
+    if (iRocchioTerm >= 0) {
+      pIdxInfo->aConstraintUsage[iRocchioTerm].argvIndex = argvIndex++;
+      pIdxInfo->aConstraintUsage[iRocchioTerm].omit = 1;
+      sqlite3_str_appendchar(idxStr, 1, VEC0_IDXSTR_KIND_KNN_ROCCHIO);
+      sqlite3_str_appendchar(idxStr, 3, '_');
+    }
+
+    if (iRocchioBetaTerm >= 0) {
+      pIdxInfo->aConstraintUsage[iRocchioBetaTerm].argvIndex = argvIndex++;
+      pIdxInfo->aConstraintUsage[iRocchioBetaTerm].omit = 1;
+      sqlite3_str_appendchar(idxStr, 1, VEC0_IDXSTR_KIND_KNN_ROCCHIO_BETA);
       sqlite3_str_appendchar(idxStr, 3, '_');
     }
 
@@ -8640,6 +8696,8 @@ int vec0Filter_knn(vec0_cursor *pCur, vec0_vtab *p, int idxNum,
   int rowid_in_idx = -1;
   int rowid_eq_idx = -1;
   int mmr_lambda_idx = -1;
+  int rocchio_idx = -1;
+  int rocchio_beta_idx = -1;
   for (int i = 0; i < argc; i++) {
     if (idxStr[1 + (i * 4)] == VEC0_IDXSTR_KIND_KNN_MATCH) {
       query_idx = i;
@@ -8655,6 +8713,12 @@ int vec0Filter_knn(vec0_cursor *pCur, vec0_vtab *p, int idxNum,
     }
     if (idxStr[1 + (i * 4)] == VEC0_IDXSTR_KIND_KNN_MMR_LAMBDA) {
       mmr_lambda_idx = i;
+    }
+    if (idxStr[1 + (i * 4)] == VEC0_IDXSTR_KIND_KNN_ROCCHIO) {
+      rocchio_idx = i;
+    }
+    if (idxStr[1 + (i * 4)] == VEC0_IDXSTR_KIND_KNN_ROCCHIO_BETA) {
+      rocchio_beta_idx = i;
     }
   }
   assert(query_idx >= 0);
@@ -8691,6 +8755,76 @@ int vec0Filter_knn(vec0_cursor *pCur, vec0_vtab *p, int idxNum,
         vector_column->dimensions, dimensions);
     rc = SQLITE_ERROR;
     goto cleanup;
+  }
+
+  // Rocchio relevance feedback: the query moves toward the vector of a row
+  // judged relevant, q' = q + beta * r, and the search runs on q', so every
+  // distance it reports is to q'. This is Rocchio's update with alpha 1 and no
+  // non-relevant term, beta defaulting to 0.75 (Manning, Raghavan and Schutze,
+  // Introduction to Information Retrieval, 9.1.1). A NULL rocchio leaves the
+  // query as given, so a query whose feedback row is not known yet can still
+  // name the column.
+  if (rocchio_idx >= 0 &&
+      sqlite3_value_type(argv[rocchio_idx]) != SQLITE_NULL) {
+    f32 beta = 0.75f;
+    if (rocchio_beta_idx >= 0) {
+      double b = sqlite3_value_double(argv[rocchio_beta_idx]);
+      if (isnan(b) || isinf(b)) {
+        vtab_set_error(&p->base,
+                       "rocchio_beta value in knn query must be finite");
+        rc = SQLITE_ERROR;
+        goto cleanup;
+      }
+      beta = (f32)b;
+    }
+    if (vector_column->element_type != SQLITE_VEC_ELEMENT_TYPE_FLOAT32) {
+      vtab_set_error(&p->base,
+                     "rocchio feedback needs a float32 vector column, and the "
+                     "\"%.*s\" column holds %s vectors",
+                     vector_column->name_length, vector_column->name,
+                     vector_subtype_name(vector_column->element_type));
+      rc = SQLITE_ERROR;
+      goto cleanup;
+    }
+    i64 feedbackRowid;
+    if (p->pkIsText) {
+      rc = vec0_rowid_from_id(p, argv[rocchio_idx], &feedbackRowid);
+      if (rc == SQLITE_EMPTY) {
+        vtab_set_error(&p->base,
+                       "No row has the id given for rocchio feedback");
+        rc = SQLITE_ERROR;
+        goto cleanup;
+      }
+      if (rc != SQLITE_OK) {
+        goto cleanup;
+      }
+    } else if (sqlite3_value_numeric_type(argv[rocchio_idx]) ==
+               SQLITE_INTEGER) {
+      feedbackRowid = sqlite3_value_int64(argv[rocchio_idx]);
+    } else {
+      vtab_set_error(&p->base, "rocchio value in knn query must be a rowid");
+      rc = SQLITE_ERROR;
+      goto cleanup;
+    }
+    void *feedbackVector = NULL;
+    rc = vec0_get_vector_data(p, feedbackRowid, vectorColumnIdx,
+                              &feedbackVector, NULL);
+    if (rc != SQLITE_OK) {
+      goto cleanup;
+    }
+    f32 *moved = sqlite3_malloc64(dimensions * sizeof(f32));
+    if (!moved) {
+      sqlite3_free(feedbackVector);
+      rc = SQLITE_NOMEM;
+      goto cleanup;
+    }
+    for (size_t i = 0; i < dimensions; i++) {
+      moved[i] = ((f32 *)queryVector)[i] + beta * ((f32 *)feedbackVector)[i];
+    }
+    sqlite3_free(feedbackVector);
+    queryVectorCleanup(queryVector);
+    queryVector = moved;
+    queryVectorCleanup = sqlite3_free;
   }
 
   // numeric affinity, then an integer, as SQLite requires of LIMIT
@@ -10241,6 +10375,20 @@ int vec0Update_Insert(sqlite3_vtab *pVTab, int argc, sqlite3_value **argv,
       SQLITE_NULL) {
     vtab_set_error(
         pVTab, "A value was provided for the hidden \"mmr_lambda\" column.");
+    rc = SQLITE_ERROR;
+    goto cleanup;
+  }
+  // Cannot insert a value in the hidden "rocchio" or "rocchio_beta" columns
+  if (sqlite3_value_type(argv[2 + vec0_column_rocchio_idx(p)]) != SQLITE_NULL) {
+    vtab_set_error(pVTab,
+                   "A value was provided for the hidden \"rocchio\" column.");
+    rc = SQLITE_ERROR;
+    goto cleanup;
+  }
+  if (sqlite3_value_type(argv[2 + vec0_column_rocchio_beta_idx(p)]) !=
+      SQLITE_NULL) {
+    vtab_set_error(
+        pVTab, "A value was provided for the hidden \"rocchio_beta\" column.");
     rc = SQLITE_ERROR;
     goto cleanup;
   }
