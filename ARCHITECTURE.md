@@ -66,6 +66,15 @@ is associated with `argv[1]`. The 2nd block at byte offset `5-8` (inclusive) is
 associated with `argv[2]` and so on. Each block describes what kind of value or
 filter the given `argv[i]` value is.
 
+A KNN plan takes every constraint the KNN uses as one of these blocks: the
+MATCH, `k` and any hidden parameter column declared after it, a
+`rowid in (...)`, and the partition key, metadata and distance constraints,
+since each decides which rows the k nearest are taken from and none can be
+applied to the rows afterwards. When one of them reads another table of the
+query, `xBestIndex` returns `SQLITE_CONSTRAINT` for any plan in which it is
+unusable, so the planner only keeps plans that hand it to `vec0`
+(`vec0_knn_takes_constraint`).
+
 #### `VEC0_IDXSTR_KIND_KNN_MATCH` (`'{'`)
 
 `argv[i]` is the query vector of the KNN query.
