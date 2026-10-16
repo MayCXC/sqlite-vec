@@ -1,0 +1,80 @@
+import pytest
+
+# Six points on a line. The first three are tagged 1 and in partition 1, the
+# rest tagged 2 and in partition 2, so the k = 2 nearest the origin are rowids 1
+# and 2 overall, 4 and 5 among tag 2, and 1 and 6 with mmr_lambda = 0.3.
+
+
+@pytest.fixture()
+def fill(db):
+    db.execute(
+        "create virtual table v using vec0("
+        "part integer partition key, embedding float[2] distance_metric=l2, tag integer)"
+    )
+    db.executemany(
+        "insert into v(rowid, part, embedding, tag) values (?, ?, ?, ?)",
+        [[i, 1 if i <= 3 else 2, f"[{i},0]", 1 if i <= 3 else 2] for i in range(1, 7)],
+    )
+    db.execute("create table w(n integer, lambda real)")
+    db.execute("insert into w values (2, 0.3)")
+    db.execute(
+        "create table categories(id integer primary key, q text, n integer, lambda real)"
+    )
+    db.execute(
+        "insert into categories values (1, '[0,0]', 2, 1.0), (2, '[0,0]', 2, 1.0)"
+    )
+    return db
+
+
+def rowids(db, sql):
+    return [row[0] for row in db.execute(sql)]
+
+
+@pytest.mark.parametrize("tables", ["w, v", "v, w"])
+def test_k_can_come_from_another_table(fill, tables):
+    knn = f"select v.rowid from {tables} where v.embedding match '[0,0]' and v.k = w.n"
+    assert rowids(fill, knn) == [1, 2]
+
+
+@pytest.mark.parametrize("tables", ["w, v", "v, w"])
+def test_mmr_lambda_can_come_from_another_table(fill, tables):
+    knn = (
+        f"select v.rowid from {tables} where v.embedding match '[0,0]' and v.k = 2 "
+        "and v.mmr_lambda = w.lambda"
+    )
+    assert rowids(fill, knn) == [1, 6]
+
+
+# A table that supplies the query vector, k or mmr_lambda is read before v, so
+# vec0 runs one KNN per row of it, and a filter whose value comes from that
+# table applies before the k: the 2 nearest in each category.
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        "v.embedding match c.q and v.k = 2",
+        "v.embedding match '[0,0]' and v.k = c.n",
+        "v.embedding match '[0,0]' and v.k = 2 and v.mmr_lambda = c.lambda",
+    ],
+)
+@pytest.mark.parametrize("column", ["tag", "part"])
+def test_a_table_that_supplies_an_argument_filters_before_the_k(
+    fill, column, arguments
+):
+    knn = (
+        f"select c.id, v.rowid from v join categories c on c.id = v.{column} "
+        f"where {arguments}"
+    )
+    assert [tuple(row) for row in fill.execute(knn)] == [(1, 1), (1, 2), (2, 4), (2, 5)]
+
+
+# A filter whose value comes from a table that supplies no KNN argument runs on
+# the k rows the KNN returns, so a lookup join returns k rows. Running one KNN
+# per categories row instead would return k rows per category here;
+# ARCHITECTURE.md's idxStr section says why vec0 keeps the filter out of the KNN.
+@pytest.mark.parametrize("column", ["tag", "part"])
+def test_a_lookup_join_on_a_filter_column_returns_k_rows(fill, column):
+    knn = (
+        f"select c.id, v.rowid from v join categories c on c.id = v.{column} "
+        "where v.embedding match '[0,0]' and v.k = 2"
+    )
+    assert [tuple(row) for row in fill.execute(knn)] == [(1, 1), (1, 2)]

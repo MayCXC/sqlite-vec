@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- A KNN query that takes its query vector, `k`, or `mmr_lambda` from another table of a join now uses it. `select v.rowid from p join v on v.embedding match ? and v.k = p.k` failed with `A LIMIT or 'k = ?' constraint is required`; the same join with `v.k = 3 and v.mmr_lambda = p.lambda` returned no rows; and `select v.rowid from v join p on p.id = v.tag where v.embedding match p.vector and v.k = 2`, with `p.id` an integer primary key, could return no rows. These joins now run one KNN per row of the other table, so a filter on the `vec0` table whose value comes from that table applies before the k nearest rows are chosen. Ported in part from the unmerged [vlasky#14](https://github.com/vlasky/sqlite-vec/pull/14) ([asg017#331](https://github.com/asg017/sqlite-vec/pull/331)), which also applies filters whose value comes from a joined table before the k nearest rows are chosen; that part is not ported, and ARCHITECTURE.md's idxStr section says why.
+
 ## [2.1.1] - 2026-10-09
 
 Opens tables whose vector column definition 2.0.2 accepted, which 2.1.0 failed to open. 2.1.0 was not published to npm, so 2.1.1 is the first npm release with 2.1.0's changes; read 2.1.0's notes before upgrading from 2.0.2.

@@ -143,6 +143,29 @@ where p.embedding match :query
 If KNN returns rowids `[0,1,2,3,4,5,6,7,8,9]` but only `[0,2,4,6,8]` are electronics,
 you get 5 results instead of 10.
 
+A filter on a `vec0` column, such as a metadata column or partition key, whose
+value comes from a joined table is also applied after the search, unless the
+query requires that table to be read first: when that table supplies the query
+vector, `k`, or `mmr_lambda`, when a `CROSS JOIN` names it first, or when the
+`vec0` table is on the right of a `LEFT JOIN`. Then the KNN runs once per row of
+that table and applies the filter during the search. In a `LEFT JOIN` this holds
+only for a filter in the `ON` clause; a filter in the `WHERE` clause is applied
+to the rows each search returns. A correlated subquery also applies the filter
+during the search, with the other table's columns as constants:
+
+```sql
+-- products has the `category text` metadata column from the example above
+create table featured (category text);
+
+select f.category,
+  (select json_group_array(p.rowid)
+   from products p
+   where p.embedding match :query
+     and k = 10
+     and p.category = f.category) as nearest
+from featured f;
+```
+
 ### Workarounds for JOIN filtering
 
 **Option 1: Use metadata columns** (recommended)
