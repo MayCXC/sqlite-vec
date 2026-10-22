@@ -159,16 +159,24 @@ condition on a partition key column restricts the search to the partitions
 whose key satisfies it, except in the forms listed below. `LIKE` and `GLOB`
 match as in SQLite, and `LIKE` follows `PRAGMA case_sensitive_like`.
 
-When `vec0` uses an `=`, `!=`, `<`, `<=`, `>`, `>=`, or `BETWEEN` condition on
-a `text` key, it compares bytewise and ignores any `COLLATE` clause, so
-`name = 'alice' collate nocase` does not search a partition keyed `'Alice'`.
+An `=`, `<`, `<=`, `>`, `>=`, or `BETWEEN` condition on a `text` key compares
+under the `BINARY`, `NOCASE`, or `RTRIM` collation that the query names, so
+`name = 'alice' collate nocase` searches a partition keyed `'Alice'`; any other
+collation fails the query with `Collation "x" is not supported on the "name"
+partition key in a vec0 KNN query. Only BINARY, NOCASE, and RTRIM are
+supported.` A `!=` condition with `COLLATE` on the value, as in
+`name != 'alice' collate nocase`, can return fewer than `k` rows, because
+`vec0` compares it bytewise and SQLite drops each returned row that equals the
+value under that collation.
+
 `vec0` uses an `IN` condition that names a collation other than `BINARY`, such
-as `name collate nocase in ('alice', 'bob')`, only as one bytewise `=` per
-value: it searches the `'alice'` and `'bob'` partitions one at a time and
-returns up to `k` rows from each, and the query fails if it uses `LIMIT`
-instead of `k = ?`. SQLite first keeps only one of the values that the
-collation treats as equal, so `name collate nocase in ('alice', 'Alice')`
-searches only one of those two partitions. An `IS NOT` condition with `COLLATE` on the value, as in
+as `name collate nocase in ('alice', 'bob')`, only as one `=` per value under
+that collation: it searches the partitions equal to `'alice'` under `NOCASE`,
+such as `'alice'` and `'Alice'`, and then those equal to `'bob'`, and returns
+up to `k` rows from each, and the query fails if it uses `LIMIT` instead of
+`k = ?`. SQLite first keeps only one of the values that the collation treats
+as equal, so `name collate nocase in ('alice', 'Alice')` runs one `=`, which
+searches both of those partitions. An `IS NOT` condition with `COLLATE` on the value, as in
 `name is not 'alice' collate nocase`, can return fewer than `k` rows, because
 `vec0` compares it bytewise and SQLite drops each returned row that equals the
 value under that collation.
@@ -193,9 +201,9 @@ conditions include:
   `name collate nocase != 'alice'`
 - `NOT IN`, `NOT LIKE`, and `NOT GLOB`
 - `LIKE ... ESCAPE`. For some patterns that begin with literal text, such as
-  `'a!_%' escape '!'`, SQLite also passes `vec0` range conditions, which `vec0`
-  compares bytewise, so the query can return fewer than `k` rows even with
-  `LIMIT`, without an error.
+  `'a!_%' escape '!'`, SQLite instead passes `vec0` range conditions that
+  select the same rows, so the query returns up to `k` matching rows and works
+  with `LIMIT`.
 - `IS TRUE`, `IS FALSE`, `IS NOT TRUE`, and `IS NOT FALSE`
 - conditions joined with `OR`, except `=` conditions on one column, which
   SQLite turns into `IN`

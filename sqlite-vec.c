@@ -6442,10 +6442,9 @@ static int vec0BestIndex(sqlite3_vtab *pVTab, sqlite3_index_info *pIdxInfo) {
       int partition_idx = vec0_column_idx_to_partition_idx(p, iColumn);
       char value = 0;
       int omit = 1;
-      // vec0 compares partition keys bytewise. An IN or IS that names another
-      // collation keeps the handling it had before vec0 consumed them: an IN
-      // stays an `=` that SQLite runs once per value, and SQLite applies an IS
-      // to the rows vec0 returns.
+      // An IN or IS that names a collation other than BINARY keeps the handling
+      // it had before vec0 consumed them: an IN stays an `=` that SQLite runs
+      // once per value, and SQLite applies an IS to the rows vec0 returns.
       int isBinary =
           sqlite3_stricmp(sqlite3_vtab_collation(pIdxInfo, i), "BINARY") == 0;
 
@@ -6512,6 +6511,43 @@ static int vec0BestIndex(sqlite3_vtab *pVTab, sqlite3_index_info *pIdxInfo) {
       }
       }
 
+      // The _chunks query compares a text key under the collation the query
+      // names, as the metadata constraints below do. SQLite reports BINARY for
+      // != whatever collation the query names, so vec0 compares it bytewise
+      // and SQLite re-checks each row, as for IS NOT.
+      char collation = VEC0_METADATA_COLLATION_BINARY;
+      if (value && p->paritition_columns[partition_idx].type == SQLITE_TEXT) {
+        switch (value) {
+        case VEC0_PARTITION_OPERATOR_EQ:
+        case VEC0_PARTITION_OPERATOR_GT:
+        case VEC0_PARTITION_OPERATOR_LE:
+        case VEC0_PARTITION_OPERATOR_LT:
+        case VEC0_PARTITION_OPERATOR_GE: {
+          const char *zCollation = sqlite3_vtab_collation(pIdxInfo, i);
+          if (sqlite3_stricmp(zCollation, "NOCASE") == 0) {
+            collation = VEC0_METADATA_COLLATION_NOCASE;
+          } else if (sqlite3_stricmp(zCollation, "RTRIM") == 0) {
+            collation = VEC0_METADATA_COLLATION_RTRIM;
+          } else if (sqlite3_stricmp(zCollation, "BINARY") != 0) {
+            rc = SQLITE_ERROR;
+            vtab_set_error(pVTab,
+                           "Collation \"%s\" is not supported on the \"%.*s\" "
+                           "partition key in a vec0 KNN query. Only BINARY, "
+                           "NOCASE, and RTRIM are supported.",
+                           zCollation,
+                           p->paritition_columns[partition_idx].name_length,
+                           p->paritition_columns[partition_idx].name);
+            goto done;
+          }
+          break;
+        }
+        case VEC0_PARTITION_OPERATOR_NE: {
+          omit = 0;
+          break;
+        }
+        }
+      }
+
       if (value) {
         pIdxInfo->aConstraintUsage[i].argvIndex = argvIndex++;
         pIdxInfo->aConstraintUsage[i].omit = omit;
@@ -6519,7 +6555,7 @@ static int vec0BestIndex(sqlite3_vtab *pVTab, sqlite3_index_info *pIdxInfo) {
                                VEC0_IDXSTR_KIND_KNN_PARTITON_CONSTRAINT);
         sqlite3_str_appendchar(idxStr, 1, 'A' + partition_idx);
         sqlite3_str_appendchar(idxStr, 1, value);
-        sqlite3_str_appendchar(idxStr, 1, '_');
+        sqlite3_str_appendchar(idxStr, 1, collation);
       }
     }
 
@@ -7095,7 +7131,7 @@ int vec0_chunks_iter(vec0_vtab *p, const char *idxStr, int argc,
 
     int partition_idx = idxStr[idx + 1] - 'A';
     int operator = idxStr[idx + 2];
-    // idxStr[idx + 3] is just null, a '_' placeholder
+    char collation = idxStr[idx + 3];
 
     if (!appendedWhere) {
       sqlite3_str_appendall(s, " WHERE ");
@@ -7163,6 +7199,11 @@ int vec0_chunks_iter(vec0_vtab *p, const char *idxStr, int argc,
       sqlite3_free(zSql);
       return SQLITE_ERROR;
     }
+    }
+    if (collation == VEC0_METADATA_COLLATION_NOCASE) {
+      sqlite3_str_appendall(s, "COLLATE NOCASE ");
+    } else if (collation == VEC0_METADATA_COLLATION_RTRIM) {
+      sqlite3_str_appendall(s, "COLLATE RTRIM ");
     }
   }
 

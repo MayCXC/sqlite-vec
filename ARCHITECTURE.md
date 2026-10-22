@@ -240,20 +240,24 @@ of the `_chunks` query, so the query fails to prepare when the distinct values
 of its `IN` blocks and its other partition key values together number more
 than `SQLITE_LIMIT_VARIABLE_NUMBER`. `ISNULL` and `ISNOTNULL` blocks bind nothing.
 
-These conditions compare text with `BINARY` (`LIKE` and `GLOB` keep their own
-case rules, and `LIKE` follows `PRAGMA case_sensitive_like`), and they see only
-`argv[i]`'s value, not the affinity of the expression that produced it, so
-`p IS CAST(5 AS INTEGER)` does not match a text `'5'`. `EQ`, `NE`, and the
-range operators are encoded whatever collation the query names. An `IN` or
-`IS` constraint is encoded as such only when `sqlite3_vtab_collation()`
-reports `BINARY`: an `IN` with another collation is encoded as `EQ`, which
-SQLite runs once per value that is distinct under that collation, as before
-`vec0` encoded `IN`, and an `IS` with
-another collation is left to SQLite. SQLite reports `BINARY` for `IS NOT`
-whatever collation the query names, so `xBestIndex` leaves `omit` unset for it
-and SQLite re-checks each row.
+These conditions see only `argv[i]`'s value, not the affinity of the
+expression that produced it, so `p IS CAST(5 AS INTEGER)` does not match a
+text `'5'`. On a text key, `EQ` and the range operators compare under the
+collation `sqlite3_vtab_collation()` reports, which the fourth character of the
+block carries as for a metadata constraint (`'_'`, `'n'` or `'r'`, below) and
+`vec0_chunks_iter()` appends to the condition as `COLLATE NOCASE` or
+`COLLATE RTRIM`; `xBestIndex` rejects any other collation on them. `LIKE` and
+`GLOB` keep their own case rules, and `LIKE` follows
+`PRAGMA case_sensitive_like`. An `IN` or `IS` constraint is encoded as such only
+when `sqlite3_vtab_collation()` reports `BINARY`: an `IN` with another
+collation is encoded as `EQ`, which SQLite runs once per value that is distinct
+under that collation, as before `vec0` encoded `IN`, and an `IS` with another
+collation is left to SQLite. SQLite reports `BINARY` for `NE` and `IS NOT`
+whatever collation the query names, so on a text key `xBestIndex` leaves
+`omit` unset for them and SQLite re-checks each row.
 
-The fourth character of the block is a `_` filler.
+The fourth character of the block is the collation of a text key's `EQ` or
+range constraint, and a `_` filler otherwise.
 
 #### `VEC0_IDXSTR_KIND_POINT_ID` (`'!'`)
 

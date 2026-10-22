@@ -1,6 +1,8 @@
 import sqlite3
 from collections import OrderedDict
 
+import pytest
+
 
 def test_constructor_limit(db, snapshot):
     assert (
@@ -216,12 +218,12 @@ def test_knn_partition_filters_match_plain_table(db):
 
 
 def test_knn_partition_filters_with_collation(db):
-    # vec0 compares partition keys bytewise. SQLite reports a text IS
-    # constraint's collation, so vec0 leaves one that names another collation
-    # to SQLite, which applies it to the k rows vec0 returns. It reports BINARY
-    # for IS NOT whatever collation the query names, so vec0 filters bytewise
-    # and SQLite re-checks each row. Either way a query returns the nearest of
-    # the plain table's rows, possibly fewer than k, so this asserts a prefix.
+    # SQLite reports a text IS constraint's collation, so vec0 leaves one that
+    # names a collation other than BINARY to SQLite, which applies it to the k
+    # rows vec0 returns. It reports BINARY for IS NOT whatever collation the
+    # query names, so vec0 filters bytewise and SQLite re-checks each row.
+    # Either way a query returns the nearest of the plain table's rows,
+    # possibly fewer than k, so this asserts a prefix.
     _create_partition_filter_tables(db)
     conditions = []
     for collation in ["nocase", "rtrim"]:
@@ -238,37 +240,87 @@ def test_knn_partition_filters_with_collation(db):
                     assert len(actual) <= k
 
 
-def test_knn_partition_in_with_collation_keeps_bytewise_matches(db):
-    # vec0 runs an IN that names a collation other than BINARY as one bytewise
-    # `=` per value, as it did before it consumed IN. When only one value has
-    # matches and they have no case or trailing-space variants, that returns
-    # the plain table's rows; leaving the IN to SQLite would apply it to the k
-    # nearest "other" rows and return none.
+def test_knn_partition_comparisons_with_collation(db):
+    # The _chunks query compares a text key under the collation the query
+    # names. SQLite reports BINARY for != whatever collation the query names,
+    # so vec0 compares it bytewise and SQLite re-checks each row: a query
+    # returns the nearest of the plain table's rows, possibly fewer than k.
+    _create_partition_filter_tables(db)
+    values = ["a", "A", "abc", "ABC", "abc ", "é", "É", "b", 1]
+    for collation in ["nocase", "rtrim"]:
+        for op in ["=", "<", "<=", ">", ">="]:
+            for value in values:
+                for condition in [
+                    f"p {op} ? collate {collation}",
+                    f"p collate {collation} {op} ?",
+                ]:
+                    _assert_knn_partition_filter_matches_plain(db, condition, [value])
+        condition = f"p != ? collate {collation}"
+        for value in values:
+            expected = _plain_partition_filter(db, condition, [value])
+            for k in range(1, len(PARTITION_FILTER_ROWS) + 1):
+                actual = _knn_partition_filter(db, condition, [value], "k", k)
+                assert actual == expected[: len(actual)], (condition, value, k)
+                assert len(actual) <= k
+
+
+def test_knn_partition_like_escape_with_literal_prefix(db):
+    # For a LIKE ... ESCAPE pattern that is literal text followed by %, SQLite
+    # passes vec0 range conditions that select the rows the LIKE matches, under
+    # NOCASE unless case_sensitive_like is on, so the query works with LIMIT.
+    _create_partition_filter_tables(db)
+    for case_sensitive_like in [0, 1]:
+        db.execute(f"pragma case_sensitive_like = {case_sensitive_like}")
+        for pattern in ["ab%", "AB%", "!_x%", "!%x%", "a%", "é%"]:
+            _assert_knn_partition_filter_matches_plain(
+                db, f"p like '{pattern}' escape '!'", []
+            )
+
+
+def test_knn_partition_comparison_with_other_collation_fails(db):
+    _create_partition_filter_tables(db)
+    db.create_collation("reverse", lambda a, b: (a < b) - (a > b))
+    with pytest.raises(sqlite3.OperationalError, match='Collation "reverse"'):
+        _knn_partition_filter(db, "p = ? collate reverse", ["a"], "k", 3)
+
+
+def test_knn_partition_in_with_collation_compares_each_value_under_it(db):
+    # vec0 runs an IN that names a collation other than BINARY as one `=` per
+    # value under that collation, and SQLite first keeps one of the values the
+    # collation treats as equal. When one value has matches, that returns the
+    # plain table's rows, its case variants under NOCASE and its trailing-space
+    # variants under RTRIM included; leaving the IN to SQLite would apply it to
+    # the k nearest "other" rows and return none.
     db.execute("create virtual table v using vec0(p text partition key, e float[1])")
     db.execute("create table plain(p)")
-    values = ["other"] * 6 + ["acme"] * 3 + ["beta"] * 3
+    values = ["other"] * 6 + ["acme", "ACME", "acme ", "ACME ", "beta", "acme"]
     for rowid, value in enumerate(values, 1):
         db.execute(
             "insert into v(rowid, p, e) values (?, ?, ?)", [rowid, value, f"[{rowid}]"]
         )
         db.execute("insert into plain(rowid, p) values (?, ?)", [rowid, value])
-    for collation in ["nocase", "rtrim"]:
-        condition = f"p collate {collation} in ('acme', 'zzz')"
-        expected = [
-            row[0]
-            for row in db.execute(
-                f"select rowid from plain where {condition} order by rowid"
-            )
-        ]
-        for k in range(1, len(values) + 1):
-            actual = [
+    for collation, lists in [
+        ("nocase", ["('acme', 'zzz')", "('ACME', 'zzz')", "('acme', 'ACME')"]),
+        ("rtrim", ["('acme', 'zzz')", "('acme ', 'zzz')", "('acme', 'acme ')"]),
+    ]:
+        for values_list in lists:
+            condition = f"p collate {collation} in {values_list}"
+            expected = [
                 row[0]
                 for row in db.execute(
-                    f"select rowid from v where e match '[0]' and {condition} and k = ?",
-                    [k],
+                    f"select rowid from plain where {condition} order by rowid"
                 )
             ]
-            assert actual == expected[:k], (condition, k)
+            assert len(expected) == 3, condition
+            for k in range(1, len(values) + 1):
+                actual = [
+                    row[0]
+                    for row in db.execute(
+                        f"select rowid from v where e match '[0]' and {condition} and k = ?",
+                        [k],
+                    )
+                ]
+                assert actual == expected[:k], (condition, k)
 
 
 class Row:
