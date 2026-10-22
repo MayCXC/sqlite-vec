@@ -11756,6 +11756,15 @@ struct vec_static_blob_data {
   static_blob static_blobs[MAX_STATIC_BLOBS];
 };
 
+/** Frees the registry and the names vec_static_blobsUpdate() copied in. */
+static void vec_static_blob_data_free(void *p) {
+  vec_static_blob_data *data = p;
+  for (int i = 0; i < MAX_STATIC_BLOBS; i++) {
+    sqlite3_free(data->static_blobs[i].name);
+  }
+  sqlite3_free(data);
+}
+
 typedef struct vec_static_blobs_vtab vec_static_blobs_vtab;
 struct vec_static_blobs_vtab {
   sqlite3_vtab base;
@@ -12542,7 +12551,7 @@ sqlite3_vec_static_blobs_init(sqlite3 *db, char **pzErrMsg,
     return rc;
 
   rc = sqlite3_create_module_v2(db, "vec_static_blobs", &vec_static_blobsModule,
-                                static_blob_data, sqlite3_free);
+                                static_blob_data, vec_static_blob_data_free);
   if (rc != SQLITE_OK)
     return rc;
   rc = sqlite3_create_module_v2(db, "vec_static_blob_entries",
