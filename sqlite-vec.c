@@ -12606,7 +12606,7 @@ static int vec_static_blob_entriesFilter(sqlite3_vtab_cursor *pVtabCursor,
     }
 
     bitmap_fill(candidates, bsize);
-    for (size_t i = bsize; i >= p->blob->nvectors; i--) {
+    for (size_t i = p->blob->nvectors; i < bsize; i++) {
       bitmap_set(candidates, i, 0);
     }
     i32 k_used = 0;
