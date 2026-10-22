@@ -31,6 +31,18 @@ Very much a WIP.
 - `rowid INTEGER`
 - `vector BLOB`
 
+#### `xyz_parentNN`
+
+- `rowid INTEGER`
+- `parent INTEGER`
+- `distance REAL`
+
+Only for a vector column declared with `parent_order`. A row's entry names its
+nearest row in the same partition with a smaller value in the order column, and
+the distance to it; a row without such a row has no entry, as the root of an
+R\*Tree has no entry in its `%_parent` table. `UNIQUE(parent, rowid)` gives the
+index that finds a row's children.
+
 #### `xyz_auxiliary`
 
 - `rowid INTEGER`
@@ -53,6 +65,7 @@ The supported way to tell which tables belong to a `vec0` table is by name. A
 
 - `xyz_info`, `xyz_chunks`, `xyz_rowids`: always
 - `xyz_vector_chunksNN`: one per vector column
+- `xyz_parentNN`: one per vector column declared with `parent_order`
 - `xyz_auxiliary`: only if there are auxiliary columns
 - `xyz_metadatachunksNN`: one per metadata column
 - `xyz_metadatatextNN`: one per text metadata column
@@ -69,6 +82,7 @@ join sqlite_master as s
  and substr(s.name, 1, length(v.name) + 1) = v.name || '_'
  and (substr(s.name, length(v.name) + 2) in ('rowids', 'chunks', 'info', 'auxiliary')
    or substr(s.name, length(v.name) + 2) glob 'vector_chunks[0-9][0-9]'
+   or substr(s.name, length(v.name) + 2) glob 'parent[0-9][0-9]'
    or substr(s.name, length(v.name) + 2) glob 'metadatachunks[0-9][0-9]'
    or substr(s.name, length(v.name) + 2) glob 'metadatatext[0-9][0-9]')
 where v.type = 'table' and v.rootpage = 0

@@ -2529,6 +2529,15 @@ struct VectorColumnDefinition {
   size_t dimensions;
   enum VectorElementType element_type;
   enum Vec0DistanceMetrics distance_metric;
+  // `parent_order=<metadata column>`: every row keeps a parent, the nearest
+  // row of its partition whose value in that metadata column is smaller than
+  // its own, in the _parentNN shadow table. parent_order_name points into the
+  // constructor argument, so it is read only while the table is constructed,
+  // where it resolves to parent_order_idx, the metadata column's index, and is
+  // cleared; parent_order_idx is -1 for a column that keeps no parents.
+  const char *parent_order_name;
+  int parent_order_name_length;
+  int parent_order_idx;
 };
 
 struct Vec0PartitionColumnDefinition {
@@ -2593,6 +2602,8 @@ int vec0_parse_vector_column(const char *source, int source_length,
   int nameLength;
   enum VectorElementType elementType;
   enum Vec0DistanceMetrics distanceMetric = VEC0_DISTANCE_METRIC_L2;
+  const char *parentOrderName = NULL;
+  int parentOrderNameLength = 0;
   int dimensions;
 
   vec0_scanner_init(&scanner, source, source_length);
@@ -2702,6 +2713,24 @@ int vec0_parse_vector_column(const char *source, int source_length,
         return SQLITE_ERROR;
       }
     }
+    // parent_order=<metadata column>
+    else if (keyLength == (int)strlen("parent_order") &&
+             sqlite3_strnicmp(key, "parent_order", keyLength) == 0) {
+      if (parentOrderName) {
+        return SQLITE_ERROR;
+      }
+      rc = vec0_scanner_next(&scanner, &token);
+      if (rc != VEC0_TOKEN_RESULT_SOME || token.token_type != TOKEN_TYPE_EQ) {
+        return SQLITE_ERROR;
+      }
+      rc = vec0_scanner_next(&scanner, &token);
+      if (rc != VEC0_TOKEN_RESULT_SOME ||
+          token.token_type != TOKEN_TYPE_IDENTIFIER) {
+        return SQLITE_ERROR;
+      }
+      parentOrderName = token.start;
+      parentOrderNameLength = token.end - token.start;
+    }
     // unknown key
     else {
       return SQLITE_ERROR;
@@ -2716,6 +2745,9 @@ int vec0_parse_vector_column(const char *source, int source_length,
   outColumn->distance_metric = distanceMetric;
   outColumn->element_type = elementType;
   outColumn->dimensions = dimensions;
+  outColumn->parent_order_name = parentOrderName;
+  outColumn->parent_order_name_length = parentOrderNameLength;
+  outColumn->parent_order_idx = -1;
   return SQLITE_OK;
 }
 
@@ -3772,6 +3804,24 @@ static sqlite3_module vec_npy_eachModule = {
   "CREATE TABLE " VEC0_SHADOW_VECTOR_N_NAME "("                                \
   "rowid INTEGER PRIMARY KEY,"                                                 \
   "vectors BLOB NOT NULL"                                                      \
+  ");"
+
+/// 1) schema, 2) original vtab table name, 3) vector column index
+/// The parents of a vector column with parent_order: an entry for every row
+/// but a root, as R*Tree's %_parent table holds one for every node but the root
+/// (https://sqlite.org/src/file/ext/rtree/rtree.c, "Database Format of R-Tree
+/// Tables"). distance is the column's distance from the row to its parent. The
+/// UNIQUE constraint always holds, since rowid is the key; it declares the
+/// index that finds a row's children, the derivedfrom_back index of
+/// https://sqlite.org/lang_with.html (3.3), as a constraint so that the index
+/// is renamed with the table, the way _rowids indexes its text ids.
+#define VEC0_SHADOW_PARENT_N_NAME "\"%w\".\"%w_parent%02d\""
+#define VEC0_SHADOW_PARENT_N_CREATE                                            \
+  "CREATE TABLE " VEC0_SHADOW_PARENT_N_NAME "("                                \
+  "rowid INTEGER PRIMARY KEY,"                                                 \
+  "parent INTEGER NOT NULL,"                                                   \
+  "distance REAL NOT NULL,"                                                    \
+  "UNIQUE(parent, rowid)"                                                      \
   ");"
 
 #define VEC0_SHADOW_AUXILIARY_NAME "\"%w\".\"%w_auxiliary\""
@@ -5360,6 +5410,44 @@ static int vec0_init(sqlite3 *db, void *pAux, int argc, const char *const *argv,
     goto error;
   }
 
+  // A parent_order names a metadata column, which may be defined after the
+  // vector column that names it, so it resolves once every argument is parsed.
+  for (int i = 0; i < numVectorColumns; i++) {
+    struct VectorColumnDefinition *column = &pNew->vector_columns[i];
+    if (!column->parent_order_name) {
+      continue;
+    }
+    for (int j = 0; j < numMetadataColumns; j++) {
+      if (pNew->metadata_columns[j].name_length ==
+              column->parent_order_name_length &&
+          sqlite3_strnicmp(pNew->metadata_columns[j].name,
+                           column->parent_order_name,
+                           column->parent_order_name_length) == 0) {
+        column->parent_order_idx = j;
+      }
+    }
+    if (column->parent_order_idx < 0) {
+      *pzErr = sqlite3_mprintf(
+          VEC_CONSTRUCTOR_ERROR "parent_order of the \"%.*s\" column names "
+                                "\"%.*s\", which is not a metadata column",
+          column->name_length, column->name, column->parent_order_name_length,
+          column->parent_order_name);
+      goto error;
+    }
+    vec0_metadata_column_kind orderKind =
+        pNew->metadata_columns[column->parent_order_idx].kind;
+    if (orderKind != VEC0_METADATA_COLUMN_KIND_INTEGER &&
+        orderKind != VEC0_METADATA_COLUMN_KIND_FLOAT) {
+      *pzErr = sqlite3_mprintf(
+          VEC_CONSTRUCTOR_ERROR
+          "parent_order of the \"%.*s\" column needs an integer or float "
+          "metadata column",
+          column->name_length, column->name);
+      goto error;
+    }
+    column->parent_order_name = NULL;
+  }
+
   const char *schemaName = argv[1];
   const char *tableName = argv[2];
 
@@ -5633,6 +5721,25 @@ static int vec0_init(sqlite3 *db, void *pAux, int argc, const char *const *argv,
         goto error;
       }
       sqlite3_finalize(stmt);
+
+      if (pNew->vector_columns[i].parent_order_idx < 0) {
+        continue;
+      }
+      zSql = sqlite3_mprintf(VEC0_SHADOW_PARENT_N_CREATE, pNew->schemaName,
+                             pNew->tableName, i);
+      if (!zSql) {
+        goto error;
+      }
+      rc = sqlite3_prepare_v2(db, zSql, -1, &stmt, 0);
+      sqlite3_free((void *)zSql);
+      if ((rc != SQLITE_OK) || (sqlite3_step(stmt) != SQLITE_DONE)) {
+        sqlite3_finalize(stmt);
+        *pzErr =
+            sqlite3_mprintf("Could not create '_parent%02d' shadow table: %s",
+                            i, sqlite3_errmsg(db));
+        goto error;
+      }
+      sqlite3_finalize(stmt);
     }
 
     for (int i = 0; i < pNew->numMetadataColumns; i++) {
@@ -5779,6 +5886,19 @@ static int vec0Destroy(sqlite3_vtab *pVtab) {
   for (int i = 0; i < p->numVectorColumns; i++) {
     zSql = sqlite3_mprintf("DROP TABLE \"%w\".\"%w\"", p->schemaName,
                            p->shadowVectorChunksNames[i]);
+    rc = sqlite3_prepare_v2(p->db, zSql, -1, &stmt, 0);
+    sqlite3_free((void *)zSql);
+    if ((rc != SQLITE_OK) || (sqlite3_step(stmt) != SQLITE_DONE)) {
+      rc = SQLITE_ERROR;
+      goto done;
+    }
+    sqlite3_finalize(stmt);
+
+    if (p->vector_columns[i].parent_order_idx < 0) {
+      continue;
+    }
+    zSql = sqlite3_mprintf("DROP TABLE " VEC0_SHADOW_PARENT_N_NAME,
+                           p->schemaName, p->tableName, i);
     rc = sqlite3_prepare_v2(p->db, zSql, -1, &stmt, 0);
     sqlite3_free((void *)zSql);
     if ((rc != SQLITE_OK) || (sqlite3_step(stmt) != SQLITE_DONE)) {
@@ -10100,6 +10220,469 @@ done:
   return rc;
 }
 
+#pragma region vec0 parents
+
+// A vector column with parent_order keeps every row's parent in _parentNN: the
+// nearest row of its partition, by the column's distance, whose value in the
+// order column is smaller than its own. Of rows equally near, the parent is
+// the one latest in order, then by rowid, so that copies of one vector link
+// each to the copy before it; a row with no smaller order value in its
+// partition is a root and has no entry. The table is maintained the way R*Tree
+// maintains its %_parent table (https://sqlite.org/src/file/ext/rtree/rtree.c):
+// an insert places the row (ChooseLeaf, here an exact search) and updates the
+// entries of the rows it displaces (updateMapping), a delete re-places the
+// deleted row's children (removeNode and reinsertNodeContent), and an update
+// is a delete followed by an insert.
+
+// An order column value, in the type of the metadata column.
+typedef union {
+  i64 i;
+  double f;
+} vec0_parent_order;
+
+static int vec0_parent_order_cmp(vec0_metadata_column_kind kind,
+                                 vec0_parent_order a, vec0_parent_order b) {
+  if (kind == VEC0_METADATA_COLUMN_KIND_INTEGER) {
+    return (a.i > b.i) - (a.i < b.i);
+  }
+  return (a.f > b.f) - (a.f < b.f);
+}
+
+// Reads the whole value of column zColumn in row `rowid` of shadow table
+// zTable into buf, which holds n bytes, through *pBlob, which is opened on the
+// first call and moved to the row on later ones.
+static int vec0_parent_read_blob(vec0_vtab *p, sqlite3_blob **pBlob,
+                                 const char *zTable, const char *zColumn,
+                                 i64 rowid, void *buf, int n) {
+  int rc = *pBlob ? sqlite3_blob_reopen(*pBlob, rowid)
+                  : sqlite3_blob_open(p->db, p->schemaName, zTable, zColumn,
+                                      rowid, 0, pBlob);
+  if (rc != SQLITE_OK) {
+    return rc;
+  }
+  if (sqlite3_blob_bytes(*pBlob) != n) {
+    vtab_set_error(&p->base,
+                   VEC_INTERAL_ERROR "%s.%s of row %lld has %d bytes, not %d",
+                   zTable, zColumn, rowid, sqlite3_blob_bytes(*pBlob), n);
+    return SQLITE_ERROR;
+  }
+  return sqlite3_blob_read(*pBlob, buf, n, 0);
+}
+
+// Prepares the statement that steps through the chunk_id, validity and rowids
+// of every chunk in the partition of chunk `chunk_id`. A NULL partition key
+// value belongs to the partition of the other NULLs, as rows group in SQLite.
+static int vec0_parent_partition_chunks(vec0_vtab *p, i64 chunk_id,
+                                        sqlite3_stmt **out) {
+  sqlite3_str *s = sqlite3_str_new(NULL);
+  sqlite3_str_appendf(
+      s, "SELECT chunk_id, validity, rowids FROM " VEC0_SHADOW_CHUNKS_NAME,
+      p->schemaName, p->tableName);
+  for (int i = 0; i < p->numPartitionColumns; i++) {
+    sqlite3_str_appendf(s,
+                        "%s partition%02d IS (SELECT partition%02d "
+                        "FROM " VEC0_SHADOW_CHUNKS_NAME " WHERE chunk_id = ?1)",
+                        i ? " AND" : " WHERE", i, i, p->schemaName,
+                        p->tableName);
+  }
+  char *zSql = sqlite3_str_finish(s);
+  if (!zSql) {
+    return SQLITE_NOMEM;
+  }
+  int rc = sqlite3_prepare_v2(p->db, zSql, -1, out, NULL);
+  sqlite3_free(zSql);
+  if (rc != SQLITE_OK) {
+    return rc;
+  }
+  if (p->numPartitionColumns > 0) {
+    sqlite3_bind_int64(*out, 1, chunk_id);
+  }
+  return SQLITE_OK;
+}
+
+// Steps through the rows of the partition of chunk `chunk_id` that are earlier
+// than `order` (sign < 0) or later than it (sign > 0), computing each one's
+// distance from `vector` in the vector column `vector_idx`, and calls xRow
+// with it. Chunks with no such row are not read past their order values.
+static int vec0_parent_scan(vec0_vtab *p, int vector_idx, i64 chunk_id,
+                            const void *vector, vec0_parent_order order,
+                            int sign,
+                            int (*xRow)(void *ctx, i64 rowid,
+                                        vec0_parent_order order, f32 distance),
+                            void *ctx) {
+  struct VectorColumnDefinition *column = &p->vector_columns[vector_idx];
+  int order_idx = column->parent_order_idx;
+  vec0_metadata_column_kind kind = p->metadata_columns[order_idx].kind;
+  size_t vectorSize = vector_column_byte_size(*column);
+  sqlite3_stmt *stmtChunks = NULL;
+  sqlite3_blob *blobOrders = NULL;
+  sqlite3_blob *blobVectors = NULL;
+  vec0_parent_order *orders = NULL;
+  void *vectors = NULL;
+  u8 *b = NULL;
+  int rc;
+
+  orders = sqlite3_malloc64(p->chunk_size * sizeof(vec0_parent_order));
+  vectors = sqlite3_malloc64(p->chunk_size * vectorSize);
+  b = bitmap_new(p->chunk_size);
+  if (!orders || !vectors || !b) {
+    rc = SQLITE_NOMEM;
+    goto done;
+  }
+
+  rc = vec0_parent_partition_chunks(p, chunk_id, &stmtChunks);
+  if (rc != SQLITE_OK) {
+    goto done;
+  }
+  while ((rc = sqlite3_step(stmtChunks)) == SQLITE_ROW) {
+    i64 id = sqlite3_column_int64(stmtChunks, 0);
+    const u8 *validity = sqlite3_column_blob(stmtChunks, 1);
+    const i64 *rowids = sqlite3_column_blob(stmtChunks, 2);
+    if (sqlite3_column_bytes(stmtChunks, 1) != p->chunk_size / CHAR_BIT ||
+        sqlite3_column_bytes(stmtChunks, 2) !=
+            (int)(p->chunk_size * sizeof(i64))) {
+      vtab_set_error(&p->base,
+                     VEC_INTERAL_ERROR
+                     "chunk %lld has a validity or rowids of the wrong size",
+                     id);
+      rc = SQLITE_ERROR;
+      goto done;
+    }
+    // INTEGER and FLOAT metadata chunks hold one 8-byte value per row.
+    rc = vec0_parent_read_blob(
+        p, &blobOrders, p->shadowMetadataChunksNames[order_idx], "data", id,
+        orders, p->chunk_size * sizeof(vec0_parent_order));
+    if (rc != SQLITE_OK) {
+      goto done;
+    }
+    int any = 0;
+    for (int i = 0; i < p->chunk_size; i++) {
+      int keep = bitmap_get((u8 *)validity, i) &&
+                 vec0_parent_order_cmp(kind, orders[i], order) * sign > 0;
+      bitmap_set(b, i, keep);
+      any |= keep;
+    }
+    if (!any) {
+      continue;
+    }
+    rc = vec0_parent_read_blob(
+        p, &blobVectors, p->shadowVectorChunksNames[vector_idx], "vectors", id,
+        vectors, p->chunk_size * vectorSize);
+    if (rc != SQLITE_OK) {
+      goto done;
+    }
+    for (int i = 0; i < p->chunk_size; i++) {
+      if (!bitmap_get(b, i)) {
+        continue;
+      }
+      f32 distance = vec0_compute_distance(
+          column, (const u8 *)vectors + i * vectorSize, vector);
+      rc = xRow(ctx, rowids[i], orders[i], distance);
+      if (rc != SQLITE_OK) {
+        goto done;
+      }
+    }
+  }
+  if (rc == SQLITE_DONE) {
+    rc = SQLITE_OK;
+  }
+
+done:
+  sqlite3_finalize(stmtChunks);
+  sqlite3_blob_close(blobOrders);
+  sqlite3_blob_close(blobVectors);
+  sqlite3_free(orders);
+  sqlite3_free(vectors);
+  sqlite3_free(b);
+  return rc;
+}
+
+// Whether (distance, order, rowid) a makes a nearer parent than b: a smaller
+// distance, or an equal one and a later order value, then a larger rowid.
+static int vec0_parent_nearer(vec0_metadata_column_kind kind, f32 aDistance,
+                              vec0_parent_order aOrder, i64 aRowid,
+                              f32 bDistance, vec0_parent_order bOrder,
+                              i64 bRowid) {
+  if (aDistance != bDistance) {
+    return aDistance < bDistance;
+  }
+  int c = vec0_parent_order_cmp(kind, aOrder, bOrder);
+  return c != 0 ? c > 0 : aRowid > bRowid;
+}
+
+struct Vec0ParentChoice {
+  vec0_metadata_column_kind kind;
+  int found;
+  i64 rowid;
+  vec0_parent_order order;
+  f32 distance;
+};
+
+static int vec0_parent_choose_row(void *ctx, i64 rowid, vec0_parent_order order,
+                                  f32 distance) {
+  struct Vec0ParentChoice *c = ctx;
+  if (!c->found || vec0_parent_nearer(c->kind, distance, order, rowid,
+                                      c->distance, c->order, c->rowid)) {
+    c->found = 1;
+    c->rowid = rowid;
+    c->order = order;
+    c->distance = distance;
+  }
+  return SQLITE_OK;
+}
+
+// What the tree needs of row `rowid`: its chunk, its order value, and, unless
+// vector is NULL, its vector in the column vector_idx, which the caller frees
+// with sqlite3_free().
+static int vec0_parent_row(vec0_vtab *p, int vector_idx, i64 rowid,
+                           i64 *chunk_id, vec0_parent_order *order,
+                           void **vector) {
+  i64 chunk_offset;
+  int rc = vec0_get_chunk_position(p, rowid, NULL, chunk_id, &chunk_offset);
+  if (rc != SQLITE_OK) {
+    return rc;
+  }
+  sqlite3_blob *blob = NULL;
+  rc = sqlite3_blob_open(
+      p->db, p->schemaName,
+      p->shadowMetadataChunksNames[p->vector_columns[vector_idx]
+                                       .parent_order_idx],
+      "data", *chunk_id, 0, &blob);
+  if (rc == SQLITE_OK) {
+    rc = sqlite3_blob_read(blob, order, sizeof(*order),
+                           chunk_offset * sizeof(*order));
+  }
+  sqlite3_blob_close(blob);
+  if (rc != SQLITE_OK || !vector) {
+    return rc;
+  }
+  return vec0_get_vector_data(p, rowid, vector_idx, vector, NULL);
+}
+
+// Writes row `rowid`'s entry: its parent and the distance to it, or no entry
+// when it has no parent.
+static int vec0_parent_set(vec0_vtab *p, int vector_idx, i64 rowid,
+                           const struct Vec0ParentChoice *choice) {
+  char *zSql =
+      choice->found
+          ? sqlite3_mprintf("INSERT OR REPLACE INTO " VEC0_SHADOW_PARENT_N_NAME
+                            "(rowid, parent, distance) VALUES (?1, ?2, ?3)",
+                            p->schemaName, p->tableName, vector_idx)
+          : sqlite3_mprintf("DELETE FROM " VEC0_SHADOW_PARENT_N_NAME
+                            " WHERE rowid = ?1",
+                            p->schemaName, p->tableName, vector_idx);
+  if (!zSql) {
+    return SQLITE_NOMEM;
+  }
+  sqlite3_stmt *stmt;
+  int rc = sqlite3_prepare_v2(p->db, zSql, -1, &stmt, NULL);
+  sqlite3_free(zSql);
+  if (rc != SQLITE_OK) {
+    return rc;
+  }
+  sqlite3_bind_int64(stmt, 1, rowid);
+  if (choice->found) {
+    sqlite3_bind_int64(stmt, 2, choice->rowid);
+    sqlite3_bind_double(stmt, 3, choice->distance);
+  }
+  rc = sqlite3_step(stmt);
+  sqlite3_finalize(stmt);
+  return rc == SQLITE_DONE ? SQLITE_OK : rc;
+}
+
+// Gives row `rowid` the parent the tree defines for it, from the rows stored
+// now (R*Tree's ChooseLeaf, made an exact search).
+static int vec0_parent_place(vec0_vtab *p, int vector_idx, i64 rowid,
+                             i64 chunk_id, vec0_parent_order order,
+                             const void *vector) {
+  struct Vec0ParentChoice choice = {
+      .kind =
+          p->metadata_columns[p->vector_columns[vector_idx].parent_order_idx]
+              .kind};
+  int rc = vec0_parent_scan(p, vector_idx, chunk_id, vector, order, -1,
+                            vec0_parent_choose_row, &choice);
+  if (rc != SQLITE_OK) {
+    return rc;
+  }
+  return vec0_parent_set(p, vector_idx, rowid, &choice);
+}
+
+struct Vec0ParentAdoption {
+  vec0_vtab *p;
+  int vector_idx;
+  vec0_metadata_column_kind kind;
+  i64 rowid;
+  vec0_parent_order order;
+  sqlite3_stmt *stmtEntry;
+};
+
+static int vec0_parent_adopt_row(void *ctx, i64 rowid, vec0_parent_order order,
+                                 f32 distance) {
+  UNUSED_PARAMETER(order);
+  struct Vec0ParentAdoption *a = ctx;
+  sqlite3_reset(a->stmtEntry);
+  sqlite3_bind_int64(a->stmtEntry, 1, rowid);
+  int rc = sqlite3_step(a->stmtEntry);
+  if (rc == SQLITE_ROW) {
+    i64 parent = sqlite3_column_int64(a->stmtEntry, 0);
+    f32 parentDistance = (f32)sqlite3_column_double(a->stmtEntry, 1);
+    sqlite3_reset(a->stmtEntry);
+    if (distance > parentDistance) {
+      return SQLITE_OK;
+    }
+    if (distance == parentDistance) {
+      // A tie is broken by the parent's order value, which only a tie reads.
+      i64 parentChunk;
+      vec0_parent_order parentOrder;
+      rc = vec0_parent_row(a->p, a->vector_idx, parent, &parentChunk,
+                           &parentOrder, NULL);
+      if (rc != SQLITE_OK) {
+        return rc;
+      }
+      if (!vec0_parent_nearer(a->kind, distance, a->order, a->rowid,
+                              parentDistance, parentOrder, parent)) {
+        return SQLITE_OK;
+      }
+    }
+  } else if (rc != SQLITE_DONE) {
+    return rc;
+  }
+  sqlite3_reset(a->stmtEntry);
+  struct Vec0ParentChoice choice = {
+      .found = 1, .rowid = a->rowid, .order = a->order, .distance = distance};
+  return vec0_parent_set(a->p, a->vector_idx, rowid, &choice);
+}
+
+// Makes row `rowid` the parent of every later row of its partition that it is
+// nearer than that row's parent, as R*Tree's insert rewrites the entries of
+// the cells it moves (updateMapping): a row inserted earlier in order than
+// rows already stored can be the nearest earlier row of some of them.
+static int vec0_parent_adopt(vec0_vtab *p, int vector_idx, i64 rowid,
+                             i64 chunk_id, vec0_parent_order order,
+                             const void *vector) {
+  struct Vec0ParentAdoption adoption = {
+      .p = p,
+      .vector_idx = vector_idx,
+      .kind =
+          p->metadata_columns[p->vector_columns[vector_idx].parent_order_idx]
+              .kind,
+      .rowid = rowid,
+      .order = order};
+  char *zSql =
+      sqlite3_mprintf("SELECT parent, distance FROM " VEC0_SHADOW_PARENT_N_NAME
+                      " WHERE rowid = ?1",
+                      p->schemaName, p->tableName, vector_idx);
+  if (!zSql) {
+    return SQLITE_NOMEM;
+  }
+  int rc = sqlite3_prepare_v2(p->db, zSql, -1, &adoption.stmtEntry, NULL);
+  sqlite3_free(zSql);
+  if (rc == SQLITE_OK) {
+    rc = vec0_parent_scan(p, vector_idx, chunk_id, vector, order, 1,
+                          vec0_parent_adopt_row, &adoption);
+  }
+  sqlite3_finalize(adoption.stmtEntry);
+  return rc;
+}
+
+// Places a row that was just written, and the later rows it is the nearest
+// earlier row of.
+static int vec0_parent_insert(vec0_vtab *p, int vector_idx, i64 rowid) {
+  i64 chunk_id;
+  vec0_parent_order order;
+  void *vector = NULL;
+  int rc = vec0_parent_row(p, vector_idx, rowid, &chunk_id, &order, &vector);
+  if (rc == SQLITE_OK) {
+    rc = vec0_parent_place(p, vector_idx, rowid, chunk_id, order, vector);
+  }
+  if (rc == SQLITE_OK) {
+    rc = vec0_parent_adopt(p, vector_idx, rowid, chunk_id, order, vector);
+  }
+  sqlite3_free(vector);
+  return rc;
+}
+
+// Places again every row whose parent is `rowid`, from the rows stored now.
+static int vec0_parent_replace_children(vec0_vtab *p, int vector_idx,
+                                        i64 rowid) {
+  struct Array children;
+  int rc = array_init(&children, sizeof(i64), 8);
+  if (rc != SQLITE_OK) {
+    return rc;
+  }
+  // The children are read before any is placed, since placing one rewrites
+  // the entries the read steps through.
+  sqlite3_stmt *stmt = NULL;
+  char *zSql = sqlite3_mprintf("SELECT rowid FROM " VEC0_SHADOW_PARENT_N_NAME
+                               " WHERE parent = ?1",
+                               p->schemaName, p->tableName, vector_idx);
+  if (!zSql) {
+    rc = SQLITE_NOMEM;
+    goto done;
+  }
+  rc = sqlite3_prepare_v2(p->db, zSql, -1, &stmt, NULL);
+  sqlite3_free(zSql);
+  if (rc != SQLITE_OK) {
+    goto done;
+  }
+  sqlite3_bind_int64(stmt, 1, rowid);
+  while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+    i64 child = sqlite3_column_int64(stmt, 0);
+    rc = array_append(&children, &child);
+    if (rc != SQLITE_OK) {
+      goto done;
+    }
+  }
+  if (rc != SQLITE_DONE) {
+    goto done;
+  }
+  rc = SQLITE_OK;
+
+  for (size_t i = 0; i < children.length; i++) {
+    i64 child = ((i64 *)children.z)[i];
+    i64 chunk_id;
+    vec0_parent_order order;
+    void *vector = NULL;
+    rc = vec0_parent_row(p, vector_idx, child, &chunk_id, &order, &vector);
+    if (rc == SQLITE_OK) {
+      rc = vec0_parent_place(p, vector_idx, child, chunk_id, order, vector);
+    }
+    sqlite3_free(vector);
+    if (rc != SQLITE_OK) {
+      goto done;
+    }
+  }
+
+done:
+  sqlite3_finalize(stmt);
+  array_cleanup(&children);
+  return rc;
+}
+
+// Removes a deleted row from the tree: drops its entry and places its
+// children among the rows that remain (R*Tree's removeNode and
+// reinsertNodeContent). The row is already out of its chunk.
+static int vec0_parent_delete(vec0_vtab *p, int vector_idx, i64 rowid) {
+  struct Vec0ParentChoice none = {.found = 0};
+  int rc = vec0_parent_set(p, vector_idx, rowid, &none);
+  if (rc != SQLITE_OK) {
+    return rc;
+  }
+  return vec0_parent_replace_children(p, vector_idx, rowid);
+}
+
+// Moves a row whose vector or order value changed: its children are placed
+// again, then the row is placed as an insert places it.
+static int vec0_parent_update(vec0_vtab *p, int vector_idx, i64 rowid) {
+  int rc = vec0_parent_replace_children(p, vector_idx, rowid);
+  if (rc != SQLITE_OK) {
+    return rc;
+  }
+  return vec0_parent_insert(p, vector_idx, rowid);
+}
+
+#pragma endregion
+
 // INSERT OR REPLACE deletes the existing row through vec0Update_Delete.
 int vec0Update_Delete(sqlite3_vtab *pVTab, sqlite3_value *idValue);
 
@@ -10389,6 +10972,16 @@ int vec0Update_Insert(sqlite3_vtab *pVTab, int argc, sqlite3_value **argv,
     sqlite3_value *v = argv[2 + VEC0_COLUMN_USERN_START + i];
     rc = vec0_write_metadata_value(p, metadata_idx, rowid, chunk_rowid,
                                    chunk_offset, v, 0);
+    if (rc != SQLITE_OK) {
+      goto cleanup;
+    }
+  }
+
+  for (int i = 0; i < p->numVectorColumns; i++) {
+    if (p->vector_columns[i].parent_order_idx < 0) {
+      continue;
+    }
+    rc = vec0_parent_insert(p, i, rowid);
     if (rc != SQLITE_OK) {
       goto cleanup;
     }
@@ -10783,6 +11376,17 @@ int vec0Update_Delete(sqlite3_vtab *pVTab, sqlite3_value *idValue) {
     }
   }
 
+  // 7. take the row out of the parent tree of each parent_order column
+  for (int i = 0; i < p->numVectorColumns; i++) {
+    if (p->vector_columns[i].parent_order_idx < 0) {
+      continue;
+    }
+    rc = vec0_parent_delete(p, i, rowid);
+    if (rc != SQLITE_OK) {
+      return rc;
+    }
+  }
+
   return SQLITE_OK;
 }
 
@@ -11012,6 +11616,34 @@ int vec0Update_Update(sqlite3_vtab *pVTab, int argc, sqlite3_value **argv) {
                                        valueVector);
     if (rc != SQLITE_OK) {
       return vec0_error_rc(rc);
+    }
+  }
+
+  // 6) move the row in the parent tree of each parent_order column whose
+  // vector or order value it changed
+  for (int i = 0; i < p->numVectorColumns; i++) {
+    int order_idx = p->vector_columns[i].parent_order_idx;
+    if (order_idx < 0) {
+      continue;
+    }
+    int changed = 0;
+    for (int j = 0; j < vec0_num_defined_user_columns(p); j++) {
+      sqlite3_value *value = argv[2 + VEC0_COLUMN_USERN_START + j];
+      if ((p->user_column_kinds[j] == SQLITE_VEC0_USER_COLUMN_KIND_VECTOR &&
+           p->user_column_idxs[j] == i &&
+           sqlite3_value_type(value) != SQLITE_NULL) ||
+          (p->user_column_kinds[j] == SQLITE_VEC0_USER_COLUMN_KIND_METADATA &&
+           p->user_column_idxs[j] == order_idx &&
+           !sqlite3_value_nochange(value))) {
+        changed = 1;
+      }
+    }
+    if (!changed) {
+      continue;
+    }
+    rc = vec0_parent_update(p, i, rowid);
+    if (rc != SQLITE_OK) {
+      return rc;
     }
   }
 
@@ -11519,13 +12151,16 @@ static int vec0ShadowName(const char *zName) {
       return 1;
   }
 
-  // "vector_chunksNN", one per vector column
-  static const char zVectorChunks[] = "vector_chunks";
-  size_t n = sizeof(zVectorChunks) - 1;
-  if (sqlite3_strnicmp(zName, zVectorChunks, n) == 0 && zName[n] >= '0' &&
-      zName[n] <= '9' && zName[n + 1] >= '0' && zName[n + 1] <= '9' &&
-      zName[n + 2] == '\0') {
-    return 1;
+  // "vector_chunksNN", one per vector column, and "parentNN", one per vector
+  // column with parent_order
+  static const char *azNumbered[] = {"vector_chunks", "parent"};
+  for (size_t i = 0; i < sizeof(azNumbered) / sizeof(azNumbered[0]); i++) {
+    size_t n = strlen(azNumbered[i]);
+    if (sqlite3_strnicmp(zName, azNumbered[i], n) == 0 && zName[n] >= '0' &&
+        zName[n] <= '9' && zName[n + 1] >= '0' && zName[n + 1] <= '9' &&
+        zName[n + 2] == '\0') {
+      return 1;
+    }
   }
   return 0;
 }
@@ -11630,6 +12265,21 @@ static int vec0Rename(sqlite3_vtab *pVTab, const char *zName) {
       goto done;
     }
     sqlite3_finalize(stmt);
+
+    if (p->vector_columns[i].parent_order_idx < 0) {
+      continue;
+    }
+    zSql = sqlite3_mprintf("ALTER TABLE " VEC0_SHADOW_PARENT_N_NAME
+                           " RENAME TO \"%w_parent%02d\"",
+                           p->schemaName, p->tableName, i, zName, i);
+    rc = sqlite3_prepare_v2(p->db, zSql, -1, &stmt, 0);
+    sqlite3_free((void *)zSql);
+    if ((rc != SQLITE_OK) || (sqlite3_step(stmt) != SQLITE_DONE)) {
+      rc = SQLITE_ERROR;
+      vtab_set_error(pVTab, "could not rename parent shadow table");
+      goto done;
+    }
+    sqlite3_finalize(stmt);
   }
 
   if (p->numAuxiliaryColumns > 0) {
@@ -11682,8 +12332,316 @@ done:
   return rc;
 }
 
+#if SQLITE_VERSION_NUMBER >= 3044000
+// The report an integrity check accumulates, as R*Tree's RtreeCheck does
+// (https://sqlite.org/src/file/ext/rtree/rtree.c).
+#define VEC0_CHECK_MAX_ERROR 100
+
+struct Vec0Check {
+  int rc;
+  char *zReport;
+  int nErr;
+};
+
+static void vec0_check_append(struct Vec0Check *c, const char *zFmt, ...) {
+  va_list ap;
+  va_start(ap, zFmt);
+  if (c->rc == SQLITE_OK && c->nErr < VEC0_CHECK_MAX_ERROR) {
+    char *z = sqlite3_vmprintf(zFmt, ap);
+    if (!z) {
+      c->rc = SQLITE_NOMEM;
+    } else {
+      c->zReport =
+          sqlite3_mprintf("%z%s%z", c->zReport, c->zReport ? "\n" : "", z);
+      if (!c->zReport) {
+        c->rc = SQLITE_NOMEM;
+      }
+    }
+    c->nErr++;
+  }
+  va_end(ap);
+}
+
+// Whether a row of the partition of chunk `chunk_id` has an order value in
+// the column order_idx smaller than `order`.
+static int vec0_parent_has_earlier(vec0_vtab *p, int order_idx, i64 chunk_id,
+                                   vec0_parent_order order, int *out) {
+  vec0_metadata_column_kind kind = p->metadata_columns[order_idx].kind;
+  sqlite3_stmt *stmtChunks = NULL;
+  sqlite3_blob *blobOrders = NULL;
+  vec0_parent_order *orders =
+      sqlite3_malloc64(p->chunk_size * sizeof(vec0_parent_order));
+  int rc = orders ? vec0_parent_partition_chunks(p, chunk_id, &stmtChunks)
+                  : SQLITE_NOMEM;
+  *out = 0;
+  while (rc == SQLITE_OK && !*out &&
+         (rc = sqlite3_step(stmtChunks)) == SQLITE_ROW) {
+    i64 id = sqlite3_column_int64(stmtChunks, 0);
+    const u8 *validity = sqlite3_column_blob(stmtChunks, 1);
+    if (sqlite3_column_bytes(stmtChunks, 1) != p->chunk_size / CHAR_BIT) {
+      rc = SQLITE_CORRUPT;
+      break;
+    }
+    rc = vec0_parent_read_blob(
+        p, &blobOrders, p->shadowMetadataChunksNames[order_idx], "data", id,
+        orders, p->chunk_size * sizeof(vec0_parent_order));
+    for (int i = 0; rc == SQLITE_OK && i < p->chunk_size; i++) {
+      if (bitmap_get((u8 *)validity, i) &&
+          vec0_parent_order_cmp(kind, orders[i], order) < 0) {
+        *out = 1;
+      }
+    }
+  }
+  if (rc == SQLITE_DONE || rc == SQLITE_ROW) {
+    rc = SQLITE_OK;
+  }
+  sqlite3_finalize(stmtChunks);
+  sqlite3_blob_close(blobOrders);
+  sqlite3_free(orders);
+  return rc;
+}
+
+// Checks the parent table of the vector column vector_idx against the rows,
+// as R*Tree's rtreecheck() checks its %_parent and %_rowid tables against
+// its nodes: every row's entry names a row of its partition that is earlier
+// than it, at the distance the entry records; a row without an entry has no
+// earlier row in its partition; and the table has no other entries.
+static void vec0_parent_check(vec0_vtab *p, int vector_idx,
+                              struct Vec0Check *c) {
+  struct VectorColumnDefinition *column = &p->vector_columns[vector_idx];
+  int order_idx = column->parent_order_idx;
+  vec0_metadata_column_kind kind = p->metadata_columns[order_idx].kind;
+  size_t vectorSize = vector_column_byte_size(*column);
+  sqlite3_stmt *stmtChunks = NULL;
+  sqlite3_stmt *stmtEntry = NULL;
+  sqlite3_stmt *stmtSamePartition = NULL;
+  sqlite3_stmt *stmtCount = NULL;
+  sqlite3_blob *blobOrders = NULL;
+  sqlite3_blob *blobVectors = NULL;
+  vec0_parent_order *orders =
+      sqlite3_malloc64(p->chunk_size * sizeof(vec0_parent_order));
+  void *vectors = sqlite3_malloc64(p->chunk_size * vectorSize);
+  i64 nEntries = 0;
+  int rc;
+  char *zSql;
+
+  if (!orders || !vectors) {
+    rc = SQLITE_NOMEM;
+    goto done;
+  }
+
+  zSql = sqlite3_mprintf(
+      "SELECT chunk_id, validity, rowids FROM " VEC0_SHADOW_CHUNKS_NAME,
+      p->schemaName, p->tableName);
+  rc = zSql ? sqlite3_prepare_v2(p->db, zSql, -1, &stmtChunks, NULL)
+            : SQLITE_NOMEM;
+  sqlite3_free(zSql);
+  if (rc != SQLITE_OK) {
+    goto done;
+  }
+  zSql =
+      sqlite3_mprintf("SELECT parent, distance FROM " VEC0_SHADOW_PARENT_N_NAME
+                      " WHERE rowid = ?1",
+                      p->schemaName, p->tableName, vector_idx);
+  rc = zSql ? sqlite3_prepare_v2(p->db, zSql, -1, &stmtEntry, NULL)
+            : SQLITE_NOMEM;
+  sqlite3_free(zSql);
+  if (rc != SQLITE_OK) {
+    goto done;
+  }
+  if (p->numPartitionColumns > 0) {
+    sqlite3_str *s = sqlite3_str_new(NULL);
+    sqlite3_str_appendall(s, "SELECT 1");
+    for (int i = 0; i < p->numPartitionColumns; i++) {
+      sqlite3_str_appendf(s, " AND a.partition%02d IS b.partition%02d", i, i);
+    }
+    sqlite3_str_appendf(
+        s,
+        " FROM " VEC0_SHADOW_CHUNKS_NAME " AS a, " VEC0_SHADOW_CHUNKS_NAME
+        " AS b WHERE a.chunk_id = ?1 AND b.chunk_id = ?2",
+        p->schemaName, p->tableName, p->schemaName, p->tableName);
+    zSql = sqlite3_str_finish(s);
+    rc = zSql ? sqlite3_prepare_v2(p->db, zSql, -1, &stmtSamePartition, NULL)
+              : SQLITE_NOMEM;
+    sqlite3_free(zSql);
+    if (rc != SQLITE_OK) {
+      goto done;
+    }
+  }
+
+  while (c->nErr < VEC0_CHECK_MAX_ERROR &&
+         (rc = sqlite3_step(stmtChunks)) == SQLITE_ROW) {
+    i64 id = sqlite3_column_int64(stmtChunks, 0);
+    const u8 *validity = sqlite3_column_blob(stmtChunks, 1);
+    const i64 *rowids = sqlite3_column_blob(stmtChunks, 2);
+    if (sqlite3_column_bytes(stmtChunks, 1) != p->chunk_size / CHAR_BIT ||
+        sqlite3_column_bytes(stmtChunks, 2) !=
+            (int)(p->chunk_size * sizeof(i64))) {
+      vec0_check_append(
+          c, "Chunk %lld has a validity or rowids of the wrong size", id);
+      continue;
+    }
+    rc = vec0_parent_read_blob(
+        p, &blobOrders, p->shadowMetadataChunksNames[order_idx], "data", id,
+        orders, p->chunk_size * sizeof(vec0_parent_order));
+    if (rc == SQLITE_OK) {
+      rc = vec0_parent_read_blob(
+          p, &blobVectors, p->shadowVectorChunksNames[vector_idx], "vectors",
+          id, vectors, p->chunk_size * vectorSize);
+    }
+    if (rc != SQLITE_OK) {
+      goto done;
+    }
+    for (int i = 0; i < p->chunk_size && c->rc == SQLITE_OK &&
+                    c->nErr < VEC0_CHECK_MAX_ERROR;
+         i++) {
+      if (!bitmap_get((u8 *)validity, i)) {
+        continue;
+      }
+      i64 rowid = rowids[i];
+      sqlite3_bind_int64(stmtEntry, 1, rowid);
+      rc = sqlite3_step(stmtEntry);
+      if (rc == SQLITE_DONE) {
+        sqlite3_reset(stmtEntry);
+        int hasEarlier;
+        rc = vec0_parent_has_earlier(p, order_idx, id, orders[i], &hasEarlier);
+        if (rc != SQLITE_OK) {
+          goto done;
+        }
+        if (hasEarlier) {
+          vec0_check_append(c,
+                            "Row %lld has no entry in %%_parent%02d, but an "
+                            "earlier row in its partition",
+                            rowid, vector_idx);
+        }
+        continue;
+      }
+      if (rc != SQLITE_ROW) {
+        goto done;
+      }
+      i64 parent = sqlite3_column_int64(stmtEntry, 0);
+      f32 distance = (f32)sqlite3_column_double(stmtEntry, 1);
+      sqlite3_reset(stmtEntry);
+      nEntries++;
+
+      i64 parentChunk;
+      vec0_parent_order parentOrder;
+      void *parentVector = NULL;
+      rc = vec0_parent_row(p, vector_idx, parent, &parentChunk, &parentOrder,
+                           &parentVector);
+      if (rc == SQLITE_EMPTY) {
+        vec0_check_append(c, "Parent %lld of row %lld is not a row", parent,
+                          rowid);
+        continue;
+      }
+      if (rc != SQLITE_OK) {
+        goto done;
+      }
+      if (vec0_parent_order_cmp(kind, parentOrder, orders[i]) >= 0) {
+        vec0_check_append(c, "Parent %lld of row %lld is not earlier than it",
+                          parent, rowid);
+      }
+      if (stmtSamePartition) {
+        sqlite3_bind_int64(stmtSamePartition, 1, id);
+        sqlite3_bind_int64(stmtSamePartition, 2, parentChunk);
+        rc = sqlite3_step(stmtSamePartition);
+        int same = rc == SQLITE_ROW && sqlite3_column_int(stmtSamePartition, 0);
+        sqlite3_reset(stmtSamePartition);
+        if (rc != SQLITE_ROW) {
+          sqlite3_free(parentVector);
+          goto done;
+        }
+        if (!same) {
+          vec0_check_append(c,
+                            "Parent %lld of row %lld is in another partition",
+                            parent, rowid);
+        }
+      }
+      f32 actual = vec0_compute_distance(
+          column, (const u8 *)vectors + i * vectorSize, parentVector);
+      sqlite3_free(parentVector);
+      if (actual != distance) {
+        vec0_check_append(c,
+                          "Row %lld is at distance %.9g from its parent "
+                          "%lld, not the %.9g in %%_parent%02d",
+                          rowid, (double)actual, parent, (double)distance,
+                          vector_idx);
+      }
+    }
+  }
+  if (c->nErr >= VEC0_CHECK_MAX_ERROR) {
+    rc = SQLITE_OK;
+    goto done;
+  }
+  if (rc != SQLITE_DONE) {
+    goto done;
+  }
+
+  zSql = sqlite3_mprintf("SELECT count(*) FROM " VEC0_SHADOW_PARENT_N_NAME,
+                         p->schemaName, p->tableName, vector_idx);
+  rc = zSql ? sqlite3_prepare_v2(p->db, zSql, -1, &stmtCount, NULL)
+            : SQLITE_NOMEM;
+  sqlite3_free(zSql);
+  if (rc != SQLITE_OK) {
+    goto done;
+  }
+  rc = sqlite3_step(stmtCount);
+  if (rc != SQLITE_ROW) {
+    goto done;
+  }
+  if (c->nErr < VEC0_CHECK_MAX_ERROR &&
+      sqlite3_column_int64(stmtCount, 0) != nEntries) {
+    vec0_check_append(c,
+                      "Wrong number of entries in %%_parent%02d table - "
+                      "expected %lld, actual %lld",
+                      vector_idx, nEntries, sqlite3_column_int64(stmtCount, 0));
+  }
+  rc = SQLITE_OK;
+
+done:
+  if (c->rc == SQLITE_OK && rc != SQLITE_OK) {
+    c->rc = rc;
+  }
+  sqlite3_finalize(stmtChunks);
+  sqlite3_finalize(stmtEntry);
+  sqlite3_finalize(stmtSamePartition);
+  sqlite3_finalize(stmtCount);
+  sqlite3_blob_close(blobOrders);
+  sqlite3_blob_close(blobVectors);
+  sqlite3_free(orders);
+  sqlite3_free(vectors);
+}
+
+// xIntegrity (https://sqlite.org/vtab.html#xintegrity), run by PRAGMA
+// integrity_check: checks the parent tables of the parent_order columns.
+static int vec0Integrity(sqlite3_vtab *pVTab, const char *zSchema,
+                         const char *zTabName, int mFlags, char **pzErr) {
+  UNUSED_PARAMETER(zSchema);
+  UNUSED_PARAMETER(zTabName);
+  UNUSED_PARAMETER(mFlags);
+  vec0_vtab *p = (vec0_vtab *)pVTab;
+  struct Vec0Check check = {0};
+  for (int i = 0; i < p->numVectorColumns && check.rc == SQLITE_OK; i++) {
+    if (p->vector_columns[i].parent_order_idx >= 0) {
+      vec0_parent_check(p, i, &check);
+    }
+  }
+  if (check.rc != SQLITE_OK || !check.zReport) {
+    sqlite3_free(check.zReport);
+    return check.rc;
+  }
+  *pzErr = sqlite3_mprintf("In vec0 %s.%s:\n%z", p->schemaName, p->tableName,
+                           check.zReport);
+  return *pzErr ? SQLITE_OK : SQLITE_NOMEM;
+}
+#endif
+
 static sqlite3_module vec0Module = {
+#if SQLITE_VERSION_NUMBER >= 3044000
+    /* iVersion      */ 4,
+#else
     /* iVersion      */ 3,
+#endif
     /* xCreate       */ vec0Create,
     /* xConnect      */ vec0Connect,
     /* xBestIndex    */ vec0BestIndex,
@@ -11708,7 +12666,7 @@ static sqlite3_module vec0Module = {
     /* xRollbackTo   */ 0,
     /* xShadowName   */ vec0ShadowName,
 #if SQLITE_VERSION_NUMBER >= 3044000
-    /* xIntegrity    */ 0, // https://github.com/asg017/sqlite-vec/issues/44
+    /* xIntegrity    */ vec0Integrity,
 #endif
 };
 #pragma endregion

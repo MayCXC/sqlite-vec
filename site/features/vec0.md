@@ -327,3 +327,47 @@ datatypes that won't be a part of a `WHERE` clause of a KNN query. Auxiliary col
 that will appear often in a `SELECT` clause but not in the `WHERE` clause.
 
 A maximum of 16 auxiliary columns can be declared in a `vec0` virtual table.
+
+## Parents {#parent-order}
+
+A vector column declared with `parent_order=<column>` keeps a parent for every
+row: the row of its partition nearest it, in the column's distance metric,
+among the rows whose value in that column is smaller than its own. The named
+column must be an `integer` or `float` metadata column, such as a creation time.
+Of rows at the same distance, the parent is the one with the larger value in
+that column, then the larger rowid, so copies of one vector link each to the
+copy before it. A row with no smaller value in its partition is a root and has
+no parent.
+
+```sql
+create virtual table vec_notes using vec0(
+  embedding float[768] distance_metric=cosine parent_order=created,
+  created integer
+);
+```
+
+`vec0` keeps the parents in a table named after the virtual table and the vector
+column's position among the vector columns, here `vec_notes_parent00`, with one
+row per row that has a parent: its `rowid`, its `parent`, and the `distance`
+between them. The table is indexed on `parent`, so a recursive query walks the
+rows derived from a note, as in
+[SQLite's family tree examples](https://sqlite.org/lang_with.html):
+
+```sql
+with recursive derived(rowid, depth) as (
+  select 42, 0
+  union all
+  select p.rowid, derived.depth + 1
+  from vec_notes_parent00 as p
+  join derived on p.parent = derived.rowid
+)
+select rowid, depth from derived;
+```
+
+Every change keeps the parents. An insert searches the row's partition for its
+parent as a KNN query with `k = 1` would, and makes the new row the parent of
+each later row that it is nearer than that row's parent. A delete gives the
+deleted row's children new parents. An `UPDATE` of the vector or of the named
+column moves the row as a delete and an insert would. `PRAGMA integrity_check`
+checks that each parent is a row of the same partition with a smaller value in
+the named column, at the recorded distance, and that only roots lack a parent.
