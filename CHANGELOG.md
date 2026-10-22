@@ -5,6 +5,7 @@
 ### Changed
 
 - Reading a vector column without a KNN query, as in `select embedding from v`, reads each chunk's vectors through one blob handle instead of opening the chunk's blob again for every row: selecting every vector of a 10,000-row `float[768]` table took 25 ms instead of 2,080 ms, and `select vec_distance_cosine(embedding, ?) from v` 41 ms instead of 2,093 ms.
+- A KNN query picks each chunk's k nearest rows with the heap of upstream's `SQLITE_VEC_EXPERIMENTAL_MIN_IDX` build option ([asg017/sqlite-vec@0de765f](https://github.com/asg017/sqlite-vec/commit/0de765f4570c1d65a0699e8e38d6c5562da9e23e)) instead of one pass over the chunk for every row it keeps, ordered so that it returns the same rows in the same order as before: on a 10,000-row `float[768]` table, `k = 1000` and `k = 4096` take 9.3 ms instead of 17.8 and 18.0 ms, `k = 100` 8.8 ms instead of 9.2, and `k = 1` 8.7 ms either way. A NaN distance, which only a static blob can produce since `vec0` rejects NaN elements, ranks after every number instead of where its position put it.
 
 ### Fixed
 
