@@ -5020,8 +5020,15 @@ int vec0_new_chunk(vec0_vtab *p, sqlite3_value **partitionKeyValues,
 }
 
 struct vec0_query_fullscan_data {
+  // Every row as (rowid, chunk_id, chunk_offset), in storage order.
   sqlite3_stmt *rowids_stmt;
   i8 done;
+  // Per vector column, a handle on the vectors blob of the chunk the scan last
+  // read from. A chunk's blob holds chunk_size vectors, and opening it seeks
+  // through its overflow pages, so a scan keeps it open across the chunk's
+  // rows instead of opening it once per row.
+  sqlite3_blob *vectorBlobs[VEC0_MAX_VECTOR_COLUMNS];
+  i64 vectorBlobChunkIds[VEC0_MAX_VECTOR_COLUMNS];
 };
 void vec0_query_fullscan_data_clear(
     struct vec0_query_fullscan_data *fullscan_data) {
@@ -5031,6 +5038,10 @@ void vec0_query_fullscan_data_clear(
   if (fullscan_data->rowids_stmt) {
     sqlite3_finalize(fullscan_data->rowids_stmt);
     fullscan_data->rowids_stmt = NULL;
+  }
+  for (int i = 0; i < VEC0_MAX_VECTOR_COLUMNS; i++) {
+    sqlite3_blob_close(fullscan_data->vectorBlobs[i]);
+    fullscan_data->vectorBlobs[i] = NULL;
   }
 }
 
@@ -9015,7 +9026,7 @@ int vec0Filter_fullscan(vec0_vtab *p, vec0_cursor *pCur) {
   }
   memset(fullscan_data, 0, sizeof(*fullscan_data));
 
-  zSql = sqlite3_mprintf(" SELECT rowid "
+  zSql = sqlite3_mprintf(" SELECT rowid, chunk_id, chunk_offset "
                          " FROM " VEC0_SHADOW_ROWIDS_NAME
                          " ORDER by chunk_id, chunk_offset ",
                          p->schemaName, p->tableName);
@@ -9226,6 +9237,72 @@ static int vec0Eof(sqlite3_vtab_cursor *cur) {
   return 1;
 }
 
+/**
+ * @brief Read the vector of the full scan's current row, through the handle the
+ * scan keeps on the row's chunk.
+ *
+ * The scan visits rows in (chunk_id, chunk_offset) order, so the handle moves
+ * to the next chunk with sqlite3_blob_reopen() once per chunk. A write that
+ * replaces the chunk's row expires the handle (sqlite3_blob_read() answers
+ * SQLITE_ABORT, https://sqlite.org/c3ref/blob_open.html), and the read is
+ * retried once on a newly opened handle.
+ *
+ * @param outVector set to a buffer the caller frees with sqlite3_free()
+ */
+static int vec0_fullscan_read_vector(vec0_vtab *p,
+                                     struct vec0_query_fullscan_data *f,
+                                     int vector_idx, void **outVector,
+                                     int *outVectorSize) {
+  i64 rowid = sqlite3_column_int64(f->rowids_stmt, 0);
+  i64 chunk_id = sqlite3_column_int64(f->rowids_stmt, 1);
+  i64 chunk_offset = sqlite3_column_int64(f->rowids_stmt, 2);
+  int size = vector_column_byte_size(p->vector_columns[vector_idx]);
+  void *buf = sqlite3_malloc(size);
+  if (!buf) {
+    return SQLITE_NOMEM;
+  }
+
+  sqlite3_blob **blob = &f->vectorBlobs[vector_idx];
+  int rc = SQLITE_ABORT;
+  for (int attempt = 0; attempt < 2 && rc == SQLITE_ABORT; attempt++) {
+    if (*blob && f->vectorBlobChunkIds[vector_idx] != chunk_id &&
+        sqlite3_blob_reopen(*blob, chunk_id) != SQLITE_OK) {
+      sqlite3_blob_close(*blob);
+      *blob = NULL;
+    }
+    if (!*blob) {
+      rc = sqlite3_blob_open(p->db, p->schemaName,
+                             p->shadowVectorChunksNames[vector_idx], "vectors",
+                             chunk_id, 0, blob);
+      if (rc != SQLITE_OK) {
+        *blob = NULL;
+        sqlite3_free(buf);
+        vtab_set_error(
+            &p->base,
+            "Could not fetch vector data for %lld, opening blob failed", rowid);
+        return vec0_error_rc(rc);
+      }
+    }
+    f->vectorBlobChunkIds[vector_idx] = chunk_id;
+    rc = sqlite3_blob_read(*blob, buf, size, chunk_offset * size);
+    if (rc == SQLITE_ABORT) {
+      sqlite3_blob_close(*blob);
+      *blob = NULL;
+    }
+  }
+  if (rc != SQLITE_OK) {
+    sqlite3_free(buf);
+    vtab_set_error(
+        &p->base,
+        "Could not fetch vector data for %lld, reading from blob failed",
+        rowid);
+    return SQLITE_ERROR;
+  }
+  *outVector = buf;
+  *outVectorSize = size;
+  return SQLITE_OK;
+}
+
 static int vec0Column_fullscan(vec0_vtab *pVtab, vec0_cursor *pCur,
                                sqlite3_context *context, int i) {
   if (!pCur->fullscan_data) {
@@ -9244,7 +9321,8 @@ static int vec0Column_fullscan(vec0_vtab *pVtab, vec0_cursor *pCur,
     void *v;
     int sz;
     int vector_idx = vec0_column_idx_to_vector_idx(pVtab, i);
-    int rc = vec0_get_vector_data(pVtab, rowid, vector_idx, &v, &sz);
+    int rc = vec0_fullscan_read_vector(pVtab, pCur->fullscan_data, vector_idx,
+                                       &v, &sz);
     if (rc != SQLITE_OK) {
       return rc;
     }
