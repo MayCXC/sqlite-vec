@@ -22,6 +22,8 @@ extern int sqlite3_vec_init(sqlite3 *db, char **pzErrMsg,
                             const sqlite3_api_routines *pApi);
 extern int sqlite3_vec_numpy_init(sqlite3 *db, char **pzErrMsg,
                                   const sqlite3_api_routines *pApi);
+extern int sqlite3_vec_static_blobs_init(sqlite3 *db, char **pzErrMsg,
+                                         const sqlite3_api_routines *pApi);
 
 #define CHECK_OK(rc, msg)                                                      \
   do {                                                                         \
@@ -986,6 +988,65 @@ cleanup:
   return result;
 }
 
+static int test_static_blobs(void) {
+  printf("Testing static blobs...\n");
+  sqlite3 *db = NULL;
+  sqlite3_stmt *stmt = NULL;
+  int rc;
+  int result = 1;
+
+  static float vectors[64 * 4];
+  for (int i = 0; i < 64; i++) {
+    for (int j = 0; j < 4; j++) {
+      vectors[i * 4 + j] = i / 64.0f;
+    }
+  }
+
+  rc = sqlite3_open(":memory:", &db);
+  CHECK_OK(rc, "open database");
+  rc = sqlite3_vec_static_blobs_init(db, NULL, NULL);
+  CHECK_OK(rc, "register static blobs");
+
+  rc = sqlite3_prepare_v2(db,
+                          "INSERT INTO temp.vec_static_blobs(name, data) "
+                          "SELECT 'w', vec_static_blob_from_raw(?1, '<f4', 4, "
+                          "64)",
+                          -1, &stmt, NULL);
+  CHECK_OK(rc, "prepare static blob registration");
+  sqlite3_bind_int64(stmt, 1, (sqlite3_int64)(intptr_t)vectors);
+  rc = sqlite3_step(stmt);
+  CHECK_DONE(rc, "register static blob");
+  sqlite3_finalize(stmt);
+  stmt = NULL;
+
+  rc = sqlite3_exec(db,
+                    "CREATE VIRTUAL TABLE w USING vec_static_blob_entries(w)",
+                    NULL, NULL, NULL);
+  CHECK_OK(rc, "create static blob entries table");
+
+  rc = sqlite3_prepare_v2(db, "SELECT count(*) FROM w", -1, &stmt, NULL);
+  CHECK_OK(rc, "prepare static blob count");
+  rc = sqlite3_step(stmt);
+  CHECK_ROW(rc, "static blob count");
+  if (sqlite3_column_int64(stmt, 0) != 64) {
+    fprintf(stderr, "FAILED: static blob has %lld entries, not 64\n",
+            sqlite3_column_int64(stmt, 0));
+    goto cleanup;
+  }
+  sqlite3_finalize(stmt);
+  stmt = NULL;
+
+  printf("  PASS: static blobs\n");
+  result = 0;
+
+cleanup:
+  if (stmt)
+    sqlite3_finalize(stmt);
+  if (db)
+    sqlite3_close(db);
+  return result;
+}
+
 static int test_npy_truncated_headers(void) {
   printf("Testing truncated numpy headers...\n");
   sqlite3 *db = NULL;
@@ -1111,6 +1172,7 @@ int main(void) {
   failures += test_insert_with_multiple_vectors();
   failures += test_error_path_leaks();
   failures += test_unaligned_blob_vectors();
+  failures += test_static_blobs();
   failures += test_npy_truncated_headers();
   failures += test_parser_edge_inputs();
 
