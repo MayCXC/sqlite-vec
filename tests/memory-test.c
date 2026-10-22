@@ -995,12 +995,15 @@ static int test_static_blobs(void) {
   int rc;
   int result = 1;
 
+  // 64 vectors fill a KNN's candidate bitmap to its last byte, so a write past
+  // its end lands outside the allocation.
   static float vectors[64 * 4];
   for (int i = 0; i < 64; i++) {
     for (int j = 0; j < 4; j++) {
       vectors[i * 4 + j] = i / 64.0f;
     }
   }
+  float query[4] = {0.5f, 0.5f, 0.5f, 0.5f};
 
   rc = sqlite3_open(":memory:", &db);
   CHECK_OK(rc, "open database");
@@ -1035,6 +1038,25 @@ static int test_static_blobs(void) {
   }
   sqlite3_finalize(stmt);
   stmt = NULL;
+
+  rc = sqlite3_prepare_v2(db,
+                          "SELECT rowid FROM w WHERE vector MATCH ?1 AND k = 3 "
+                          "ORDER BY distance",
+                          -1, &stmt, NULL);
+  CHECK_OK(rc, "prepare static blob KNN");
+  sqlite3_bind_blob(stmt, 1, query, sizeof(query), SQLITE_STATIC);
+  sqlite3_int64 expected[3] = {32, 33, 31};
+  for (int i = 0; i < 3; i++) {
+    rc = sqlite3_step(stmt);
+    CHECK_ROW(rc, "static blob KNN row");
+    if (sqlite3_column_int64(stmt, 0) != expected[i]) {
+      fprintf(stderr, "FAILED: static blob KNN row %d is %lld, not %lld\n", i,
+              sqlite3_column_int64(stmt, 0), expected[i]);
+      goto cleanup;
+    }
+  }
+  rc = sqlite3_step(stmt);
+  CHECK_DONE(rc, "static blob KNN end");
 
   printf("  PASS: static blobs\n");
   result = 0;
