@@ -29,12 +29,16 @@ else
   # Windows: -ldl not needed (Win32 API), math is linked by default
 endif
 
-# ── SIMD (auto-enabled on Apple Silicon and x86_64 Mac) ──────────────────────────
+# ── SIMD (auto-enabled on Apple Silicon, arm64 Linux and x86_64 Mac) ─────────────
+# NEON is in the arm64 baseline (GCC and Clang define __ARM_NEON for aarch64
+# with no -m flag), so the Linux build needs only the define.
 ifndef OMIT_SIMD
   ifeq ($(shell uname -sm),Darwin x86_64)
     CFLAGS += -mavx -DSQLITE_VEC_ENABLE_AVX
   else ifeq ($(shell uname -sm),Darwin arm64)
     CFLAGS += -mcpu=apple-m1 -DSQLITE_VEC_ENABLE_NEON
+  else ifeq ($(shell uname -sm),Linux aarch64)
+    CFLAGS += -DSQLITE_VEC_ENABLE_NEON
   endif
 endif
 
