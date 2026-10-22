@@ -126,7 +126,9 @@ vec0 KNN query. Only BINARY, NOCASE, and RTRIM are supported.` A `!=` or
 `IS NOT` condition with `COLLATE` on the value, as in
 `genre != 'scifi' collate nocase`, can return fewer than `k` rows, because
 `vec0` compares it bytewise and SQLite drops each returned row that equals the
-value under that collation.
+value under that collation. `BINARY` orders text as SQLite does in the
+database's encoding: in a UTF-16 database, by the bytes of its UTF-16 form,
+which puts some characters in another order than UTF-8 does.
 
 SQLite does not pass some conditions on metadata columns to `vec0`, and
 instead applies them to the `k` rows that `vec0` returns. A KNN query with such

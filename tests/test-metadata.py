@@ -2,6 +2,7 @@ import pytest
 import sqlite3
 from collections import OrderedDict
 import json
+from conftest import get_extension_path
 
 
 def test_constructor_limit(db, snapshot):
@@ -1613,6 +1614,124 @@ def test_knn_filters_compare_as_sqlite(db):
         if knn(where) != sql(where):
             mismatches.append((where, None, knn(where), sql(where)))
     assert mismatches == []
+
+
+@pytest.mark.parametrize("encoding", ["UTF-16le", "UTF-16be"])
+def test_knn_text_filters_in_utf16_database(encoding):
+    # SQLite orders text under BINARY by the bytes of the database's encoding,
+    # which orders some characters differently in UTF-16 than in UTF-8, and
+    # vec0 compares in that order, so a filter keeps the plain table's rows
+    # before the k nearest are chosen and works with LIMIT. A literal GLOB or
+    # LIKE pattern adds the range conditions SQLite derives from its prefix.
+    db = sqlite3.connect(":memory:")
+    db.enable_load_extension(True)
+    db.load_extension(get_extension_path())
+    db.enable_load_extension(False)
+    db.execute(f"pragma encoding = '{encoding}'")
+    db.execute(
+        "create virtual table v using vec0(vector float[1], t text, chunk_size=8)"
+    )
+    db.execute("create table plain(id integer primary key, t text)")
+    texts = [
+        "a",
+        "Ā",
+        "￿",
+        "\U0001f600",
+        "z",
+        "é",
+        "abcdefghijkl￿",
+        "abcdefghijkl\U0001f600",
+        "abc",
+        "ABC",
+        "abd",
+        "abĀ",
+    ]
+    # row i's vector is [i], so a query for [0] ranks rows by rowid
+    for i, t in enumerate(texts, 1):
+        db.execute("insert into v(rowid, vector, t) values (?, ?, ?)", [i, f"[{i}]", t])
+        db.execute("insert into plain values (?, ?)", [i, t])
+
+    def plain(where, parameters):
+        return [
+            r[0]
+            for r in db.execute(
+                f"select id from plain where {where} order by id", parameters
+            )
+        ]
+
+    def knn(where, parameters, form, k):
+        return [
+            r[0]
+            for r in db.execute(
+                f"select rowid from v where vector match '[0]' and {where} {form}",
+                parameters + [k],
+            )
+        ]
+
+    mismatches = []
+    for op in ["=", "!=", "<", "<=", ">", ">="]:
+        for collation in ["", " collate nocase", " collate rtrim"]:
+            for value in texts:
+                where = f"t {op} ?{collation}"
+                want = plain(where, [value])
+                got = sorted(knn(where, [value], "and k = ?", len(texts)))
+                if got != want:
+                    mismatches.append((where, value, got, want))
+                if op == "!=" and collation:
+                    # SQLite checks a collated != again, so it can drop rows
+                    continue
+                for k in range(1, len(texts) + 1):
+                    for form in ["and k = ?", "limit ?"]:
+                        got = knn(where, [value], form, k)
+                        if got != want[:k]:
+                            mismatches.append((where, value, form, k, got))
+    literal_patterns = [
+        f"t like '{p}'" for p in ["ab%", "AB%", "abc%", "abcdefghijkl%", "Ā%", "é%"]
+    ] + [f"t glob '{p}'" for p in ["ab*", "abc*", "abcdefghijkl*", "Ā*", "a[b]*"]]
+    for case_sensitive_like in [0, 1]:
+        db.execute(f"pragma case_sensitive_like = {case_sensitive_like}")
+        for where in literal_patterns:
+            want = plain(where, [])
+            for k in range(1, len(texts) + 1):
+                for form in ["and k = ?", "limit ?"]:
+                    got = knn(where, [], form, k)
+                    if got != want[:k]:
+                        mismatches.append((where, case_sensitive_like, form, k, got))
+    assert mismatches == []
+
+
+def test_knn_fails_to_open_when_encoding_is_unreadable(tmp_path):
+    # vec0 reads the database's text encoding with PRAGMA encoding when it
+    # opens a table, so a connection whose authorizer denies the pragma fails
+    # to open it instead of comparing text in a guessed encoding.
+    path = str(tmp_path / "encoding.db")
+    db = sqlite3.connect(path)
+    db.enable_load_extension(True)
+    db.load_extension(get_extension_path())
+    db.execute("create virtual table v using vec0(vector float[1], t text)")
+    db.execute(
+        "insert into v(rowid, vector, t) values (1, '[1]', 'a'), (2, '[2]', 'z')"
+    )
+    db.commit()
+    db.close()
+
+    db = sqlite3.connect(path)
+    db.enable_load_extension(True)
+    db.load_extension(get_extension_path())
+    db.set_authorizer(
+        lambda action, *args: (
+            sqlite3.SQLITE_DENY
+            if action == sqlite3.SQLITE_PRAGMA
+            else sqlite3.SQLITE_OK
+        )
+    )
+    with pytest.raises(
+        sqlite3.OperationalError,
+        match="could not read the database's text encoding: not authorized",
+    ):
+        db.execute(
+            "select rowid from v where vector match '[0]' and k = 1 and t > 'm'"
+        ).fetchall()
 
 
 def test_knn_text_filter_null_long_value(db):

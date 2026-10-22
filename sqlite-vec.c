@@ -4066,6 +4066,11 @@ struct vec0_vtab {
   // Will change the schema of the _rowids table, and insert/query logic.
   int pkIsText;
 
+  // The database's text encoding, SQLITE_UTF8, SQLITE_UTF16LE or
+  // SQLITE_UTF16BE. vec0 keeps text metadata as UTF-8, and SQLite orders text
+  // under BINARY by the bytes of the database's encoding.
+  int textEncoding;
+
   // True if the table declares the hidden command column named after the
   // table, which runs `INSERT INTO t(t) VALUES ('optimize')`. False when
   // another column has the table's name; see vec0_init().
@@ -5369,6 +5374,40 @@ void vec0_cursor_clear(vec0_cursor *pCur) {
   }
 }
 
+// Reads the database's text encoding into *pEncoding: SQLITE_UTF8,
+// SQLITE_UTF16LE or SQLITE_UTF16BE. Every attached database shares the main
+// database's encoding. PRAGMA encoding names it "UTF-8", "UTF-16le" or
+// "UTF-16be", and a build with SQLITE_OMIT_UTF16 has no such pragma, so it
+// returns no row there, where every database is UTF-8 (PragTyp_ENCODING in
+// https://sqlite.org/src/file/src/pragma.c and sqlite3InitOne() in
+// https://sqlite.org/src/file/src/prepare.c).
+static int vec0_read_text_encoding(sqlite3 *db, int *pEncoding) {
+  sqlite3_stmt *stmt = NULL;
+  int rc = sqlite3_prepare_v2(db, "PRAGMA encoding", -1, &stmt, NULL);
+  if (rc != SQLITE_OK) {
+    return rc;
+  }
+  *pEncoding = SQLITE_UTF8;
+  rc = sqlite3_step(stmt);
+  if (rc == SQLITE_ROW) {
+    const char *zEncoding = (const char *)sqlite3_column_text(stmt, 0);
+    if (!zEncoding) {
+      rc = SQLITE_NOMEM;
+    } else {
+      if (sqlite3_stricmp(zEncoding, "UTF-16le") == 0) {
+        *pEncoding = SQLITE_UTF16LE;
+      } else if (sqlite3_stricmp(zEncoding, "UTF-16be") == 0) {
+        *pEncoding = SQLITE_UTF16BE;
+      }
+      rc = SQLITE_OK;
+    }
+  } else if (rc == SQLITE_DONE) {
+    rc = SQLITE_OK;
+  }
+  sqlite3_finalize(stmt);
+  return rc;
+}
+
 #define VEC_CONSTRUCTOR_ERROR "vec0 constructor error: "
 static int vec0_init(sqlite3 *db, void *pAux, int argc, const char *const *argv,
                      sqlite3_vtab **ppVtab, char **pzErr, bool isCreate) {
@@ -5376,6 +5415,23 @@ static int vec0_init(sqlite3 *db, void *pAux, int argc, const char *const *argv,
   vec0_vtab *pNew;
   int rc;
   const char *zSql;
+
+  // The text filters need the encoding, so a failed read fails the
+  // constructor; an interrupted one reports as an interrupt, as
+  // vec0_interrupt_result() makes the other methods do.
+  int textEncoding;
+  rc = vec0_read_text_encoding(db, &textEncoding);
+  if (rc != SQLITE_OK) {
+    if (rc == SQLITE_INTERRUPT) {
+      *pzErr = sqlite3_mprintf("%s", sqlite3_errstr(rc));
+    } else {
+      *pzErr =
+          sqlite3_mprintf(VEC_CONSTRUCTOR_ERROR
+                          "could not read the database's text encoding: %s",
+                          sqlite3_errmsg(db));
+    }
+    return vec0_error_rc(rc);
+  }
 
   pNew = sqlite3_malloc(sizeof(*pNew));
   if (pNew == 0)
@@ -5725,6 +5781,7 @@ static int vec0_init(sqlite3 *db, void *pAux, int argc, const char *const *argv,
 
   pNew->db = db;
   pNew->pkIsText = pkColumnType == SQLITE_TEXT;
+  pNew->textEncoding = textEncoding;
   pNew->hasCommandColumn = hasCommandColumn;
   pNew->schemaName = sqlite3_mprintf("%s", schemaName);
   if (!pNew->schemaName) {
@@ -7457,12 +7514,96 @@ static int vec0_text_binary_cmp(const char *a, int na, const char *b, int nb) {
   return (na > nb) - (na < nb);
 }
 
-// Compares text the way SQLite's BINARY, NOCASE, or RTRIM collation does.
-// NOCASE folds ASCII letters only, and sqlite3_strnicmp() stops at a NUL both
-// values have at the same offset. RTRIM ignores trailing spaces, but no other
-// trailing whitespace.
-static int vec0_text_cmp(vec0_metadata_collation collation, const char *a,
-                         int na, const char *b, int nb) {
+// The UTF-8 conversion below is SQLite's own, from READ_UTF8, WRITE_UTF16LE,
+// WRITE_UTF16BE and sqlite3Utf8Trans1[] in
+// https://sqlite.org/src/file/src/utf.c, so a value converts to the bytes
+// SQLite stores for it in a UTF-16 database.
+static const unsigned char vec0Utf8Trans1[] = {
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
+    0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
+    0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x00,
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
+    0x0c, 0x0d, 0x0e, 0x0f, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+    0x07, 0x00, 0x01, 0x02, 0x03, 0x00, 0x01, 0x00, 0x00,
+};
+
+// Reads one character of UTF-8, reading an overlong form, a surrogate, U+FFFE
+// or U+FFFF as U+FFFD.
+static u32 vec0_utf8_read(const unsigned char **pz, const unsigned char *zEnd) {
+  u32 c = *((*pz)++);
+  if (c >= 0xc0) {
+    c = vec0Utf8Trans1[c - 0xc0];
+    while (*pz != zEnd && (**pz & 0xc0) == 0x80) {
+      c = (c << 6) + (0x3f & *((*pz)++));
+    }
+    if (c < 0x80 || (c & 0xFFFFF800) == 0xD800 || (c & 0xFFFFFFFE) == 0xFFFE) {
+      c = 0xFFFD;
+    }
+  }
+  return c;
+}
+
+// Writes c as UTF-16 in the byte order of encoding, SQLITE_UTF16LE or
+// SQLITE_UTF16BE, and returns the number of bytes, 2 or 4.
+static int vec0_utf16_write(unsigned char *z, u32 c, int encoding) {
+  // the offsets of the high and low byte within each 16-bit unit
+  int hi = encoding == SQLITE_UTF16BE ? 0 : 1;
+  int lo = 1 - hi;
+  if (c <= 0xFFFF) {
+    z[hi] = (unsigned char)((c >> 8) & 0x00FF);
+    z[lo] = (unsigned char)(c & 0x00FF);
+    return 2;
+  }
+  z[hi] = (unsigned char)(0x00D8 + (((c - 0x10000) >> 18) & 0x03));
+  z[lo] =
+      (unsigned char)(((c >> 10) & 0x003F) + (((c - 0x10000) >> 10) & 0x00C0));
+  z[2 + hi] = (unsigned char)(0x00DC + ((c >> 8) & 0x03));
+  z[2 + lo] = (unsigned char)(c & 0x00FF);
+  return 4;
+}
+
+// Compares UTF-8 text the way SQLite's BINARY collation compares it in a
+// database whose encoding is SQLITE_UTF16LE or SQLITE_UTF16BE: memcmp() over
+// the bytes of each value's UTF-16 form, then the shorter value sorts first.
+static int vec0_text_utf16_cmp(int encoding, const char *a, int na,
+                               const char *b, int nb) {
+  const unsigned char *za = (const unsigned char *)a;
+  const unsigned char *zb = (const unsigned char *)b;
+  const unsigned char *zaEnd = za + na;
+  const unsigned char *zbEnd = zb + nb;
+  unsigned char ua[4], ub[4];
+  int ia = 0, nua = 0, ib = 0, nub = 0;
+  for (;;) {
+    if (ia == nua && za != zaEnd) {
+      nua = vec0_utf16_write(ua, vec0_utf8_read(&za, zaEnd), encoding);
+      ia = 0;
+    }
+    if (ib == nub && zb != zbEnd) {
+      nub = vec0_utf16_write(ub, vec0_utf8_read(&zb, zbEnd), encoding);
+      ib = 0;
+    }
+    int aDone = ia == nua;
+    int bDone = ib == nub;
+    if (aDone || bDone) {
+      return bDone - aDone;
+    }
+    if (ua[ia] != ub[ib]) {
+      return ua[ia] - ub[ib];
+    }
+    ia++;
+    ib++;
+  }
+}
+
+// Compares text the way SQLite's BINARY, NOCASE, or RTRIM collation does in a
+// database of the given text encoding. NOCASE folds ASCII letters only, and
+// sqlite3_strnicmp() stops at a NUL both values have at the same offset. RTRIM
+// ignores trailing spaces, but no other trailing whitespace. SQLite registers
+// BINARY in each encoding and NOCASE and RTRIM for UTF-8 only, so those two
+// compare UTF-8 in every encoding (openDatabase() in
+// https://sqlite.org/src/file/src/main.c).
+static int vec0_text_cmp(vec0_metadata_collation collation, int encoding,
+                         const char *a, int na, const char *b, int nb) {
   switch (collation) {
   case VEC0_METADATA_COLLATION_NOCASE: {
     int cmp = sqlite3_strnicmp(a, b, min(na, nb));
@@ -7478,6 +7619,9 @@ static int vec0_text_cmp(vec0_metadata_collation collation, const char *a,
       nb--;
     break;
   case VEC0_METADATA_COLLATION_BINARY:
+    if (encoding != SQLITE_UTF8) {
+      return vec0_text_utf16_cmp(encoding, a, na, b, nb);
+    }
     break;
   }
   return vec0_text_binary_cmp(a, na, b, nb);
@@ -7518,8 +7662,8 @@ static int vec0_metadata_filter_text_whole(
       }
     }
     for (size_t j = 0; j < nTargets; j++) {
-      int cmp =
-          vec0_text_cmp(collation, s, n, targets[j].zString, targets[j].n);
+      int cmp = vec0_text_cmp(collation, p->textEncoding, s, n,
+                              targets[j].zString, targets[j].n);
       if (vec0_metadata_operator_holds(op, cmp)) {
         bitmap_set(b, i, 1);
         break;

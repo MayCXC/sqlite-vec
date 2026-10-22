@@ -305,6 +305,14 @@ a collation, `LIKE` and `GLOB` have their own case rules, and SQLite reports
 compares those two bytewise and leaves `omit` unset, so SQLite re-checks each
 row with the query's collation.
 
+`vec0` keeps text metadata as UTF-8, while SQLite orders text under `BINARY` by
+the bytes of the database's encoding, and UTF-16 orders some characters
+differently (SQLite registers `BINARY` in each encoding and `NOCASE` and
+`RTRIM` for UTF-8 only). So `vec0_init()` reads the encoding with
+`PRAGMA encoding` into `textEncoding`, and in a UTF-16 database
+`vec0_text_cmp()` compares under `BINARY` by the bytes SQLite stores for each
+value, converting its UTF-8 as SQLite's `utf.c` does.
+
 #### `VEC0_IDXSTR_KIND_KNN_DISTANCE_CONSTRAINT` (`'*'`)
 
 `argv[i]` is a constraint on the `distance` column in a KNN query.
