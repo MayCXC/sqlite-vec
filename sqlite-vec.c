@@ -11186,7 +11186,10 @@ static int vec_static_blob_entriesOpen(sqlite3_vtab *p,
 
 static int vec_static_blob_entriesClose(sqlite3_vtab_cursor *cur) {
   vec_static_blob_entries_cursor *pCur = (vec_static_blob_entries_cursor *)cur;
-  sqlite3_free(pCur->knn_data);
+  if (pCur->knn_data) {
+    sbe_query_knn_data_clear(pCur->knn_data);
+    sqlite3_free(pCur->knn_data);
+  }
   sqlite3_free(pCur);
   return SQLITE_OK;
 }
