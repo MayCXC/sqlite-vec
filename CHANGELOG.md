@@ -5,6 +5,7 @@
 ### Changed
 
 - Reading a vector column without a KNN query, as in `select embedding from v`, reads each chunk's vectors through one blob handle instead of opening the chunk's blob again for every row: selecting every vector of a 10,000-row `float[768]` table took 25 ms instead of 2,080 ms, and `select vec_distance_cosine(embedding, ?) from v` 41 ms instead of 2,093 ms.
+- Cosine distance between `float32` vectors of more than 16 dimensions, or `int8` vectors of more than 15, uses NEON in NEON builds, which include the darwin-arm64 binary: a KNN query on a 100,000-row `float[768]` table took 26 ms instead of 94 ms on Linux arm64. `float32` distances match the scalar code's on random vectors, though a vector's distance to an identical vector, 0 or about 2e-16 in either, can change between the two. `int8` distances match up to 1,024 dimensions; past that, vectors whose squared elements sum past 2^24 get distances closer to the exact value, as NEON sums them exactly. Ported from [asg017@0de765f](https://github.com/asg017/sqlite-vec/commit/0de765f), except that `float32` sums stay in `double` ([asg017#324](https://github.com/asg017/sqlite-vec/issues/324)); asg017's kernel sums them in `float32`.
 
 ### Fixed
 
