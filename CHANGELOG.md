@@ -5,7 +5,7 @@
 ### Changed
 
 - Reading a vector column without a KNN query, as in `select embedding from v`, reads each chunk's vectors through one blob handle instead of opening the chunk's blob again for every row: selecting every vector of a 10,000-row `float[768]` table took 25 ms instead of 2,080 ms, and `select vec_distance_cosine(embedding, ?) from v` 41 ms instead of 2,093 ms.
-- The linux-arm64 and linux-arm64-musl binaries use NEON, as the darwin-arm64 binary does: `make` enables it on Linux arm64, and `OMIT_SIMD=1` builds without it. An L2 KNN query on a 100,000-row `float[768]` table took 19 ms instead of 57 ms there. L1 and Hamming distances are unchanged, but `float32` L2 distances can differ from 2.1.1's in the last digits, closer to the exact value (at 768 dimensions, a mean relative error of 3.0e-8 instead of 1.7e-7), so a KNN query can order rows with nearly equal distances differently; `int8` L2 distances whose squared differences sum past 2^24 are computed from the exact sum.
+- The linux-arm64 and linux-arm64-musl binaries use NEON, as the darwin-arm64 binary does: `make` enables it on Linux arm64, and `OMIT_SIMD=1` builds without it. An L2 KNN query on a 100,000-row `float[768]` table took 19 ms instead of 57 ms there. Hamming and `int8` L1 distances are unchanged; `float32` L1 distances can differ in the last digit when their double-precision sum rounds, and `float32` L2 distances can differ from 2.1.1's in the last digits, closer to the exact value (at 768 dimensions, a mean relative error of 3.0e-8 instead of 1.7e-7), so a KNN query can order rows with nearly equal distances differently; `int8` L2 distances whose squared differences sum past 2^24 are computed from the exact sum.
 
 ### Fixed
 
