@@ -64,8 +64,8 @@ def test_knn_ties_keep_their_order(db):
 
 
 def test_knn_ranks_a_nan_distance_last(db):
-    # vec0 refuses NaN elements, but a static blob reads its vectors from the
-    # application's memory as they are, so a distance to one can be NaN.
+    # A static blob reads its vectors from the application's memory as they
+    # are, so a distance to one can be NaN.
     db.enable_load_extension(True)
     db.load_extension(get_extension_path(), entrypoint="sqlite3_vec_static_blobs_init")
     vectors = np.array([[np.nan, 0], [1, 0], [2, 0], [3, 0]], dtype=np.float32)
@@ -80,3 +80,39 @@ def test_knn_ranks_a_nan_distance_last(db):
         [_f32([0, 0])],
     )
     assert [r[0] for r in rows] == [1, 2, 3, 0]
+
+
+def test_knn_ranks_a_stored_nan_distance_last_across_chunks(db):
+    # vec0 has rejected NaN elements since 2.1.0, but a table written by an
+    # earlier release can still hold one. Patching a NaN into the stored chunk
+    # stands in for such a table.
+    db.execute("create virtual table v using vec0(e float[1], chunk_size=8)")
+    for i in range(1, 9):
+        db.execute("insert into v(rowid, e) values (?, ?)", [i, _f32([10 + i])])
+    for i in range(9, 17):
+        db.execute("insert into v(rowid, e) values (?, ?)", [i, _f32([1])])
+    chunk_id, offset = db.execute(
+        "select chunk_id, chunk_offset from v_rowids where rowid = 16"
+    ).fetchone()
+    vectors = bytearray(
+        db.execute(
+            "select vectors from v_vector_chunks00 where rowid = ?", [chunk_id]
+        ).fetchone()[0]
+    )
+    vectors[offset * 4 : offset * 4 + 4] = _f32([float("nan")])
+    db.execute(
+        "update v_vector_chunks00 set vectors = ? where rowid = ?",
+        [bytes(vectors), chunk_id],
+    )
+
+    def knn(k):
+        return [
+            r[0]
+            for r in db.execute(
+                "select rowid from v where e match ? and k = ?", [_f32([0]), k]
+            )
+        ]
+
+    # The NaN, in the second chunk, ranks after the first chunk's rows too.
+    assert knn(16) == [15, 14, 13, 12, 11, 10, 9, 1, 2, 3, 4, 5, 6, 7, 8, 16]
+    assert knn(9) == [15, 14, 13, 12, 11, 10, 9, 1, 2]

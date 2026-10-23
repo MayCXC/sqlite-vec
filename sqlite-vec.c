@@ -6840,7 +6840,8 @@ void merge_sorted_lists(f32 *a, i64 *a_rowids, i64 a_length, f32 *b,
       out_rowids[i] = a_rowids[ptrA];
       ptrA++;
     } else {
-      if (a[ptrA] <= b[b_top_idxs[ptrB]]) {
+      // A NaN ranks after every number, as in min_idx()
+      if (a[ptrA] <= b[b_top_idxs[ptrB]] || isnan(b[b_top_idxs[ptrB]])) {
         out[i] = a[ptrA];
         out_rowids[i] = a_rowids[ptrA];
         ptrA++;
