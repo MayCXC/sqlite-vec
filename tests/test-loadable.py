@@ -486,6 +486,15 @@ def test_vec_distance_cosine():
     for n in [17, 31, 32, 40, 127, 768]:
         check(rng.uniform(-1, 1, n), rng.uniform(-1, 1, n))
         check(rng.integers(-128, 128, n), rng.integers(-128, 128, n), dtype=np.int8)
+    # check overflow of 32-bit sums. Squares of 128 (2^14) and 64 (2^12) keep
+    # every partial sum exact in f32, so the scalar build matches too.
+    # 131,072 squares of 128 sum to 2^31, past INT32_MAX:
+    check([-128] * 131072, [-128] * 131072, dtype=np.int8)
+    # 2^32 in total, which wraps a 32-bit sum to 0:
+    check([64] * 1048576, [-64] * 1048576, dtype=np.int8)
+    # 32-bit partial sums of every 8th square reach 2^31, so widening only the
+    # final sum to 64 bits is not enough:
+    check([-128] * 1048576, [-128] * 1048576, dtype=np.int8)
 
     vec_distance_cosine_bit = lambda *args: db.execute(
         "select vec_distance_cosine(vec_bit(?), vec_bit(?))", args
