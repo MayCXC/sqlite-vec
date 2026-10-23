@@ -262,7 +262,9 @@ order by distance;
 
 ### Space Reclamation with Optimize
 
-`optimize` compacts vec shadow tables. To shrink the database file:
+A `DELETE` that removes the last row of a chunk deletes the chunk, and
+`optimize` compacts the chunks that deletes leave partly empty. To shrink the
+database file:
 
 ```sql
 -- Before creating vec tables: enable autovacuum and apply it (recommended)

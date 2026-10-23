@@ -71,10 +71,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     }
   }
 
-  // Delete all remaining rows. This fork's DELETE leaves emptied chunks in
-  // place until optimize removes them.
+  // Delete all remaining rows
   sqlite3_exec(db, "DELETE FROM v", NULL, NULL, NULL);
-  sqlite3_exec(db, "INSERT INTO v(v) VALUES ('optimize')", NULL, NULL, NULL);
 
   // Assert all shadow tables are empty after full deletion
   sqlite3_prepare_v2(db,

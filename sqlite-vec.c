@@ -11123,6 +11123,110 @@ done:
   return rc;
 }
 
+// Once a DELETE has cleared the last validity bit of its chunk, delete the
+// chunk's rows from _chunks, _vector_chunksNN and _metadatachunksNN, so their
+// pages are free without an optimize.
+// https://github.com/asg017/sqlite-vec/commit/cb147c8
+int vec0Update_Delete_DeleteChunkIfEmpty(vec0_vtab *p, i64 chunk_id) {
+  int rc;
+  sqlite3_blob *blobValidity = NULL;
+  sqlite3_stmt *stmt = NULL;
+  char *zSql;
+
+  rc = sqlite3_blob_open(p->db, p->schemaName, p->shadowChunksName, "validity",
+                         chunk_id, 0, &blobValidity);
+  if (rc != SQLITE_OK) {
+    vtab_set_error(&p->base, "could not open validity blob for %s.%s.%lld",
+                   p->schemaName, p->shadowChunksName, chunk_id);
+    return vec0_error_rc(rc);
+  }
+  int validitySize = sqlite3_blob_bytes(blobValidity);
+  u8 *validity = sqlite3_malloc(validitySize);
+  if (!validity) {
+    sqlite3_blob_close(blobValidity);
+    return SQLITE_NOMEM;
+  }
+  rc = sqlite3_blob_read(blobValidity, validity, validitySize, 0);
+  int brc = sqlite3_blob_close(blobValidity);
+  if (rc != SQLITE_OK) {
+    sqlite3_free(validity);
+    vtab_set_error(&p->base, "could not read validity blob for %s.%s.%lld",
+                   p->schemaName, p->shadowChunksName, chunk_id);
+    return rc;
+  }
+  if (brc != SQLITE_OK) {
+    sqlite3_free(validity);
+    vtab_set_error(&p->base, "could not close validity blob for %s.%s.%lld",
+                   p->schemaName, p->shadowChunksName, chunk_id);
+    return brc;
+  }
+  int empty = !bitmap_any(validity, validitySize * CHAR_BIT);
+  sqlite3_free(validity);
+  if (!empty) {
+    return SQLITE_OK;
+  }
+
+  zSql = sqlite3_mprintf("DELETE FROM " VEC0_SHADOW_CHUNKS_NAME
+                         " WHERE chunk_id = ?",
+                         p->schemaName, p->tableName);
+  if (!zSql) {
+    return SQLITE_NOMEM;
+  }
+  rc = sqlite3_prepare_v2(p->db, zSql, -1, &stmt, NULL);
+  sqlite3_free(zSql);
+  if (rc != SQLITE_OK) {
+    return rc;
+  }
+  sqlite3_bind_int64(stmt, 1, chunk_id);
+  rc = sqlite3_step(stmt);
+  sqlite3_finalize(stmt);
+  if (rc != SQLITE_DONE) {
+    return vec0_error_rc(rc);
+  }
+
+  for (int i = 0; i < p->numVectorColumns; i++) {
+    zSql = sqlite3_mprintf("DELETE FROM " VEC0_SHADOW_VECTOR_N_NAME
+                           " WHERE rowid = ?",
+                           p->schemaName, p->tableName, i);
+    if (!zSql) {
+      return SQLITE_NOMEM;
+    }
+    rc = sqlite3_prepare_v2(p->db, zSql, -1, &stmt, NULL);
+    sqlite3_free(zSql);
+    if (rc != SQLITE_OK) {
+      return rc;
+    }
+    sqlite3_bind_int64(stmt, 1, chunk_id);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+      return vec0_error_rc(rc);
+    }
+  }
+
+  for (int i = 0; i < p->numMetadataColumns; i++) {
+    zSql = sqlite3_mprintf("DELETE FROM " VEC0_SHADOW_METADATA_N_NAME
+                           " WHERE rowid = ?",
+                           p->schemaName, p->tableName, i);
+    if (!zSql) {
+      return SQLITE_NOMEM;
+    }
+    rc = sqlite3_prepare_v2(p->db, zSql, -1, &stmt, NULL);
+    sqlite3_free(zSql);
+    if (rc != SQLITE_OK) {
+      return rc;
+    }
+    sqlite3_bind_int64(stmt, 1, chunk_id);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+      return vec0_error_rc(rc);
+    }
+  }
+
+  return SQLITE_OK;
+}
+
 int vec0Update_Delete(sqlite3_vtab *pVTab, sqlite3_value *idValue) {
   vec0_vtab *p = (vec0_vtab *)pVTab;
   int rc;
@@ -11184,7 +11288,7 @@ int vec0Update_Delete(sqlite3_vtab *pVTab, sqlite3_value *idValue) {
     }
   }
 
-  // 6. delete metadata
+  // 7. delete metadata
   for (int i = 0; i < p->numMetadataColumns; i++) {
     rc = vec0Update_Delete_ClearMetadata(p, i, rowid, chunk_id, chunk_offset);
     if (rc != SQLITE_OK) {
@@ -11192,7 +11296,8 @@ int vec0Update_Delete(sqlite3_vtab *pVTab, sqlite3_value *idValue) {
     }
   }
 
-  return SQLITE_OK;
+  // 8. delete the chunk if that was its last row
+  return vec0Update_Delete_DeleteChunkIfEmpty(p, chunk_id);
 }
 
 int vec0Update_UpdateAuxColumn(vec0_vtab *p, int auxiliary_column_idx,

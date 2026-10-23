@@ -386,7 +386,9 @@ def interrupt_template():
     db.load_extension(get_extension_path())
     # Text values are longer than the 12 bytes a metadata chunk holds, so
     # filters and reads go to the _metadatatext table. v's one chunk is full,
-    # so an INSERT adds a chunk; vp has a deleted row for optimize to skip.
+    # so an INSERT adds a chunk; vp has a deleted row for optimize to skip, and
+    # rowid 4 is the last row of its partition 0 chunk, so deleting it deletes
+    # the chunk.
     db.execute(
         "CREATE VIRTUAL TABLE v USING vec0(vector float[2], m integer, t text, "
         "+a text, chunk_size=8)"
@@ -500,6 +502,7 @@ def _run_interrupted(template, sql, n, mode):
         ),
         pytest.param("DELETE FROM v WHERE rowid = 4", id="delete"),
         pytest.param("DELETE FROM vt WHERE id = 'id4'", id="delete-text-pk"),
+        pytest.param("DELETE FROM vp WHERE rowid = 4", id="delete-emptying-chunk"),
         pytest.param("INSERT INTO vp(vp) VALUES ('optimize')", id="optimize"),
     ],
 )
