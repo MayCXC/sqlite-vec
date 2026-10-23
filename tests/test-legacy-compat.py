@@ -143,10 +143,9 @@ def test_legacy_name_conflict_has_no_optimize(legacy_db):
 
 def test_legacy_insert_after_chunk_deleted(legacy_db):
     # v0.1.6 declares _vector_chunks00 with "rowid PRIMARY KEY", which is not
-    # an alias for _rowid_. Once its only chunk is empty, optimize deletes it,
+    # an alias for _rowid_. Once its only chunk is empty, DELETE deletes it,
     # so the next insert creates chunk 2, whose _rowid_ would otherwise be 1.
     legacy_db.execute("DELETE FROM legacy_vectors")
-    legacy_db.execute("INSERT INTO legacy_vectors(legacy_vectors) VALUES ('optimize')")
     legacy_db.execute(
         "INSERT INTO legacy_vectors(rowid, emb) VALUES (100, ?)",
         [_f32([100.0, 0.0, 0.0, 0.0])],

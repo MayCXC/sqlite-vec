@@ -50,8 +50,10 @@ def test_optimize_reclaims_pages_with_autovacuum_incremental(tmp_path):
     db.commit()
     chunk_rows_after_insert = pragma_int(db, "select count(*) from v_chunks")
 
-    # Delete half the rows to create free space inside vec shadow tables
-    db.execute("delete from v where rowid > 128")
+    # Delete every other row to create free space inside vec shadow tables.
+    # Every chunk keeps some rows, so DELETE removes none of them and leaves the
+    # space for optimize to reclaim.
+    db.execute("delete from v where rowid % 2 = 0")
     db.commit()
     chunk_rows_after_delete = pragma_int(db, "select count(*) from v_chunks")
 
