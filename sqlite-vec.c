@@ -12525,6 +12525,8 @@ SQLITE_VEC_API int sqlite3_vec_init(sqlite3 *db, char **pzErrMsg,
                                     const sqlite3_api_routines *pApi) {
 #ifndef SQLITE_CORE
   SQLITE_EXTENSION_INIT2(pApi);
+#else
+  UNUSED_PARAMETER(pApi);
 #endif
   int rc = SQLITE_OK;
 
@@ -12611,6 +12613,8 @@ SQLITE_VEC_API int sqlite3_vec_numpy_init(sqlite3 *db, char **pzErrMsg,
   UNUSED_PARAMETER(pzErrMsg);
 #ifndef SQLITE_CORE
   SQLITE_EXTENSION_INIT2(pApi);
+#else
+  UNUSED_PARAMETER(pApi);
 #endif
   int rc = SQLITE_OK;
   rc = sqlite3_create_function_v2(db, "vec_npy_file", 1, SQLITE_RESULT_SUBTYPE,
@@ -12630,6 +12634,8 @@ sqlite3_vec_static_blobs_init(sqlite3 *db, char **pzErrMsg,
   UNUSED_PARAMETER(pzErrMsg);
 #ifndef SQLITE_CORE
   SQLITE_EXTENSION_INIT2(pApi);
+#else
+  UNUSED_PARAMETER(pApi);
 #endif
 
   int rc = SQLITE_OK;
