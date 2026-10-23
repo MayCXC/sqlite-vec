@@ -4,7 +4,7 @@
 
 ### Changed
 
-- Reading a vector column without a KNN query, as in `select embedding from v`, reads each chunk's vectors through one blob handle instead of opening the chunk's blob again for every row: selecting every vector of a 10,000-row `float[768]` table took 11 ms instead of 844 ms, and `select vec_distance_cosine(embedding, ?) from v` 30 ms instead of 807 ms.
+- Reading a vector column without a KNN query, as in `select embedding from v`, reads each chunk's vectors through one blob handle instead of opening the chunk's blob again for every row: selecting every vector of a 10,000-row `float[768]` table took 25 ms instead of 2,080 ms, and `select vec_distance_cosine(embedding, ?) from v` 41 ms instead of 2,093 ms.
 
 ### Fixed
 

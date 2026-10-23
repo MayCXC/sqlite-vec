@@ -5020,13 +5020,14 @@ int vec0_new_chunk(vec0_vtab *p, sqlite3_value **partitionKeyValues,
 }
 
 struct vec0_query_fullscan_data {
-  // Every row as (rowid, chunk_id, chunk_offset), in storage order.
+  // Every rowid, in storage order as of the scan's start.
   sqlite3_stmt *rowids_stmt;
   i8 done;
   // Per vector column, a handle on the vectors blob of the chunk the scan last
-  // read from. A chunk's blob holds chunk_size vectors, and opening it seeks
-  // through its overflow pages, so a scan keeps it open across the chunk's
-  // rows instead of opening it once per row.
+  // read from. A chunk's blob holds chunk_size vectors, and the first read
+  // through a newly opened handle walks the blob's overflow pages up to the
+  // row's offset, so a scan keeps it open across the chunk's rows instead of
+  // opening it once per row.
   sqlite3_blob *vectorBlobs[VEC0_MAX_VECTOR_COLUMNS];
   i64 vectorBlobChunkIds[VEC0_MAX_VECTOR_COLUMNS];
 };
@@ -9026,7 +9027,7 @@ int vec0Filter_fullscan(vec0_vtab *p, vec0_cursor *pCur) {
   }
   memset(fullscan_data, 0, sizeof(*fullscan_data));
 
-  zSql = sqlite3_mprintf(" SELECT rowid, chunk_id, chunk_offset "
+  zSql = sqlite3_mprintf(" SELECT rowid "
                          " FROM " VEC0_SHADOW_ROWIDS_NAME
                          " ORDER by chunk_id, chunk_offset ",
                          p->schemaName, p->tableName);
@@ -9243,9 +9244,17 @@ static int vec0Eof(sqlite3_vtab_cursor *cur) {
  *
  * The scan visits rows in (chunk_id, chunk_offset) order, so the handle moves
  * to the next chunk with sqlite3_blob_reopen() once per chunk. A write that
- * replaces the chunk's row expires the handle (sqlite3_blob_read() answers
- * SQLITE_ABORT, https://sqlite.org/c3ref/blob_open.html), and the read is
+ * replaces the chunk's row expires the handle, and sqlite3_blob_read() answers
+ * SQLITE_ABORT (https://sqlite.org/c3ref/blob_open.html). A rollback of a
+ * transaction that changed the schema invalidates it, and both
+ * sqlite3_blob_read() and sqlite3_blob_reopen() answer SQLITE_ABORT_ROLLBACK
+ * when the connection has extended result codes on. Either way the read is
  * retried once on a newly opened handle.
+ *
+ * The row's position is looked up here rather than taken from the scan's
+ * statement: that statement sorts every row when the scan starts, so its
+ * positions miss a delete, insert or optimize the same connection runs during
+ * the scan.
  *
  * @param outVector set to a buffer the caller frees with sqlite3_free()
  */
@@ -9254,8 +9263,16 @@ static int vec0_fullscan_read_vector(vec0_vtab *p,
                                      int vector_idx, void **outVector,
                                      int *outVectorSize) {
   i64 rowid = sqlite3_column_int64(f->rowids_stmt, 0);
-  i64 chunk_id = sqlite3_column_int64(f->rowids_stmt, 1);
-  i64 chunk_offset = sqlite3_column_int64(f->rowids_stmt, 2);
+  i64 chunk_id;
+  i64 chunk_offset;
+  int rc = vec0_get_chunk_position(p, rowid, NULL, &chunk_id, &chunk_offset);
+  if (rc == SQLITE_EMPTY) {
+    vtab_set_error(&p->base, "Could not find a row with rowid %lld", rowid);
+    return SQLITE_ERROR;
+  }
+  if (rc != SQLITE_OK) {
+    return rc;
+  }
   int size = vector_column_byte_size(p->vector_columns[vector_idx]);
   void *buf = sqlite3_malloc(size);
   if (!buf) {
@@ -9263,12 +9280,23 @@ static int vec0_fullscan_read_vector(vec0_vtab *p,
   }
 
   sqlite3_blob **blob = &f->vectorBlobs[vector_idx];
-  int rc = SQLITE_ABORT;
-  for (int attempt = 0; attempt < 2 && rc == SQLITE_ABORT; attempt++) {
-    if (*blob && f->vectorBlobChunkIds[vector_idx] != chunk_id &&
-        sqlite3_blob_reopen(*blob, chunk_id) != SQLITE_OK) {
-      sqlite3_blob_close(*blob);
-      *blob = NULL;
+  rc = SQLITE_ABORT;
+  for (int attempt = 0; attempt < 2 && (rc & 0xff) == SQLITE_ABORT; attempt++) {
+    if (*blob && f->vectorBlobChunkIds[vector_idx] != chunk_id) {
+      rc = sqlite3_blob_reopen(*blob, chunk_id);
+      if (rc != SQLITE_OK) {
+        sqlite3_blob_close(*blob);
+        *blob = NULL;
+      }
+      // An invalidated handle is replaced below; any other failure, such as
+      // SQLITE_INTERRUPT, fails the read.
+      if (rc != SQLITE_OK && (rc & 0xff) != SQLITE_ABORT) {
+        sqlite3_free(buf);
+        vtab_set_error(
+            &p->base,
+            "Could not fetch vector data for %lld, opening blob failed", rowid);
+        return vec0_error_rc(rc);
+      }
     }
     if (!*blob) {
       rc = sqlite3_blob_open(p->db, p->schemaName,
@@ -9285,7 +9313,7 @@ static int vec0_fullscan_read_vector(vec0_vtab *p,
     }
     f->vectorBlobChunkIds[vector_idx] = chunk_id;
     rc = sqlite3_blob_read(*blob, buf, size, chunk_offset * size);
-    if (rc == SQLITE_ABORT) {
+    if ((rc & 0xff) == SQLITE_ABORT) {
       sqlite3_blob_close(*blob);
       *blob = NULL;
     }
