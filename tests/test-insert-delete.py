@@ -8,6 +8,10 @@ def _f32(values):
     return struct.pack("%sf" % len(values), *values)
 
 
+def _int8(values):
+    return struct.pack("%sb" % len(values), *values)
+
+
 def test_insert_or_replace_integer_pk(db):
     """INSERT OR REPLACE should update vector when rowid already exists."""
     db.execute("create virtual table v using vec0(emb float[4], chunk_size=8)")
@@ -161,3 +165,76 @@ def test_insert_or_replace_rejected_keeps_original_row(db):
         "select vec_to_json(emb), tag, note from v where rowid = 1"
     ).fetchone()
     assert tuple(row) == ("[1.000000]", "old", 1)
+
+
+# The delete tests below are ported from asg017/sqlite-vec@cb147c8.
+
+
+def test_delete_with_text_primary_key(db):
+    db.execute(
+        "create virtual table v using vec0("
+        "id text primary key, emb float[4], chunk_size=8"
+        ")"
+    )
+
+    db.execute("insert into v(id, emb) values ('a', ?)", [_f32([1.0, 2.0, 3.0, 4.0])])
+    db.execute("insert into v(id, emb) values ('b', ?)", [_f32([5.0, 6.0, 7.0, 8.0])])
+
+    db.execute("delete from v where id = 'a'")
+
+    # Vector blob slot 0 should be zeroed
+    blob = db.execute(
+        "select vectors from v_vector_chunks00 where rowid = 1"
+    ).fetchone()[0]
+    first_slot = struct.unpack("<4f", blob[:16])
+    assert first_slot == (0.0, 0.0, 0.0, 0.0)
+
+    # Remaining row still queryable
+    row = db.execute("select emb from v where id = 'b'").fetchone()
+    assert row[0] == _f32([5.0, 6.0, 7.0, 8.0])
+
+
+def test_delete_int8_vectors(db):
+    db.execute("create virtual table v using vec0(emb int8[4], chunk_size=8)")
+
+    db.execute(
+        "insert into v(rowid, emb) values (1, vec_int8(?))",
+        [_int8([1, 2, 3, 4])],
+    )
+    db.execute(
+        "insert into v(rowid, emb) values (2, vec_int8(?))",
+        [_int8([5, 6, 7, 8])],
+    )
+
+    db.execute("delete from v where rowid = 1")
+
+    blob = db.execute(
+        "select vectors from v_vector_chunks00 where rowid = 1"
+    ).fetchone()[0]
+    # int8[4] = 4 bytes per slot
+    first_slot = struct.unpack("<4b", blob[:4])
+    assert first_slot == (0, 0, 0, 0)
+    second_slot = struct.unpack("<4b", blob[4:8])
+    assert second_slot == (5, 6, 7, 8)
+
+
+def test_delete_bit_vectors(db):
+    db.execute("create virtual table v using vec0(emb bit[8], chunk_size=8)")
+
+    db.execute(
+        "insert into v(rowid, emb) values (1, vec_bit(?))",
+        [bytes([0xFF])],
+    )
+    db.execute(
+        "insert into v(rowid, emb) values (2, vec_bit(?))",
+        [bytes([0xAA])],
+    )
+
+    db.execute("delete from v where rowid = 1")
+
+    blob = db.execute(
+        "select vectors from v_vector_chunks00 where rowid = 1"
+    ).fetchone()[0]
+    # bit[8] = 1 byte per slot
+    assert blob[0:1] == bytes([0x00])
+    assert blob[1:2] == bytes([0xAA])
