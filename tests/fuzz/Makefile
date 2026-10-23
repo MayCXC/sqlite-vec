@@ -26,7 +26,7 @@ FUZZ_LDFLAGS ?= $(shell \
     echo "-Wl,-ld_classic"; \
   fi)
 
-FUZZ_CFLAGS = $(FUZZ_SANITIZERS) -I ../../ -I ../../vendor -DSQLITE_CORE -DSQLITE_VEC_ENABLE_DISKANN=1 -g $(FUZZ_LDFLAGS)
+FUZZ_CFLAGS = $(FUZZ_SANITIZERS) -I ../../ -I ../../vendor -DSQLITE_CORE -DSQLITE_VEC_ENABLE_DISKANN=1 -DSQLITE_VEC_EXPERIMENTAL_IVF_ENABLE=1 -g $(FUZZ_LDFLAGS)
 FUZZ_SRCS = ../../vendor/sqlite3.c ../../sqlite-vec.c
 
 TARGET_DIR = ./targets
