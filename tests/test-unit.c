@@ -1377,6 +1377,328 @@ void test_diskann_visited_set_operations() {
 
 #endif /* SQLITE_VEC_ENABLE_DISKANN */
 
+#if SQLITE_VEC_EXPERIMENTAL_IVF_ENABLE
+
+void test_vec0_parse_vector_column_ivf() {
+  printf("Starting %s...\n", __func__);
+  struct VectorColumnDefinition col;
+  int rc;
+
+  // Every default
+  {
+    const char *input = "v float[4] indexed by ivf()";
+    rc = vec0_parse_vector_column(input, (int)strlen(input), &col, true);
+    assert(rc == SQLITE_OK);
+    assert(col.index_type == VEC0_INDEX_TYPE_IVF);
+    assert(col.dimensions == 4);
+    assert(col.ivf.nlist == 128);
+    assert(col.ivf.nprobe == 10);
+    assert(col.ivf.quantizer == VEC0_IVF_QUANTIZER_NONE);
+    assert(col.ivf.oversample == 1);
+    sqlite3_free(col.name);
+  }
+
+  // nprobe defaults to at most nlist
+  {
+    const char *input = "v float[4] indexed by ivf(nlist=8)";
+    rc = vec0_parse_vector_column(input, (int)strlen(input), &col, true);
+    assert(rc == SQLITE_OK);
+    assert(col.ivf.nlist == 8);
+    assert(col.ivf.nprobe == 8);
+    sqlite3_free(col.name);
+  }
+
+  {
+    const char *input = "v float[4] indexed by ivf(nlist=64, nprobe=8)";
+    rc = vec0_parse_vector_column(input, (int)strlen(input), &col, true);
+    assert(rc == SQLITE_OK);
+    assert(col.ivf.nlist == 64);
+    assert(col.ivf.nprobe == 8);
+    sqlite3_free(col.name);
+  }
+
+  // distance_metric before indexed by
+  {
+    const char *input =
+        "v float[4] distance_metric=cosine indexed by ivf(nlist=16)";
+    rc = vec0_parse_vector_column(input, (int)strlen(input), &col, true);
+    assert(rc == SQLITE_OK);
+    assert(col.index_type == VEC0_INDEX_TYPE_IVF);
+    assert(col.distance_metric == VEC0_DISTANCE_METRIC_COSINE);
+    assert(col.ivf.nlist == 16);
+    sqlite3_free(col.name);
+  }
+
+  // nlist=0 leaves the centroids to set-centroid
+  {
+    const char *input = "v float[4] indexed by ivf(nlist=0)";
+    rc = vec0_parse_vector_column(input, (int)strlen(input), &col, true);
+    assert(rc == SQLITE_OK);
+    assert(col.ivf.nlist == 0);
+    sqlite3_free(col.name);
+  }
+
+  // nlist at its maximum
+  {
+    const char *input = "v float[4] indexed by ivf(nlist=65536)";
+    rc = vec0_parse_vector_column(input, (int)strlen(input), &col, true);
+    assert(rc == SQLITE_OK);
+    assert(col.ivf.nlist == 65536);
+    sqlite3_free(col.name);
+  }
+
+  // Quantizers
+  {
+    const char *input =
+        "v float[768] indexed by ivf(nlist=128, quantizer=binary)";
+    rc = vec0_parse_vector_column(input, (int)strlen(input), &col, true);
+    assert(rc == SQLITE_OK);
+    assert(col.ivf.nlist == 128);
+    assert(col.ivf.quantizer == VEC0_IVF_QUANTIZER_BINARY);
+    assert(col.ivf.oversample == 1);
+    sqlite3_free(col.name);
+  }
+
+  {
+    const char *input = "v float[768] indexed by ivf(nlist=64, quantizer=int8)";
+    rc = vec0_parse_vector_column(input, (int)strlen(input), &col, true);
+    assert(rc == SQLITE_OK);
+    assert(col.ivf.quantizer == VEC0_IVF_QUANTIZER_INT8);
+    sqlite3_free(col.name);
+  }
+
+  {
+    const char *input = "v float[768] indexed by ivf(quantizer=none)";
+    rc = vec0_parse_vector_column(input, (int)strlen(input), &col, true);
+    assert(rc == SQLITE_OK);
+    assert(col.ivf.quantizer == VEC0_IVF_QUANTIZER_NONE);
+    sqlite3_free(col.name);
+  }
+
+  // oversample with a quantizer
+  {
+    const char *input = "v float[768] indexed by ivf(nlist=128, "
+                        "quantizer=binary, oversample=10)";
+    rc = vec0_parse_vector_column(input, (int)strlen(input), &col, true);
+    assert(rc == SQLITE_OK);
+    assert(col.ivf.quantizer == VEC0_IVF_QUANTIZER_BINARY);
+    assert(col.ivf.oversample == 10);
+    assert(col.ivf.nlist == 128);
+    sqlite3_free(col.name);
+  }
+
+  // Every option, keywords in any case
+  {
+    const char *input = "v float[768] distance_metric=cosine INDEXED BY "
+                        "IVF(NLIST=256, NPROBE=16, QUANTIZER=INT8, "
+                        "OVERSAMPLE=4)";
+    rc = vec0_parse_vector_column(input, (int)strlen(input), &col, true);
+    assert(rc == SQLITE_OK);
+    assert(col.distance_metric == VEC0_DISTANCE_METRIC_COSINE);
+    assert(col.ivf.nlist == 256);
+    assert(col.ivf.nprobe == 16);
+    assert(col.ivf.quantizer == VEC0_IVF_QUANTIZER_INT8);
+    assert(col.ivf.oversample == 4);
+    sqlite3_free(col.name);
+  }
+
+  {
+    const char *input =
+        "v float[768] indexed by ivf(quantizer=binary, oversample=5)";
+    rc = vec0_parse_vector_column(input, (int)strlen(input), &col, true);
+    assert(rc == SQLITE_OK);
+    assert(col.ivf.nlist == 128);
+    assert(col.ivf.nprobe == 10);
+    assert(col.ivf.quantizer == VEC0_IVF_QUANTIZER_BINARY);
+    assert(col.ivf.oversample == 5);
+    sqlite3_free(col.name);
+  }
+
+  const char *errors[] = {
+      // an explicit nprobe past nlist
+      "v float[4] indexed by ivf(nlist=4, nprobe=10)",
+      "v float[4] indexed by ivf(bogus=1)",
+      "v float[4] indexed by hnsw()",
+      "v float[4] indexed by ivf(nlist=65537)",
+      "v float[4] indexed by ivf(nlist=-1)",
+      "v float[4] indexed by ivf(nprobe=0)",
+      // oversample only ranks a quantizer's candidates
+      "v float[768] indexed by ivf(oversample=10)",
+      "v float[768] indexed by ivf(quantizer=binary, oversample=0)",
+      "v float[768] indexed by ivf(quantizer=pq)",
+      // the binary quantizer packs 8 dimensions to a byte
+      "v float[12] indexed by ivf(quantizer=binary)",
+      // only float32 columns
+      "v int8[8] indexed by ivf()",
+      "v bit[8] indexed by ivf()",
+      // whole keywords and values, all digits, no trailing comma
+      "v float[8] indexed by ivf(quantizer=bin)",
+      "v float[8] indexed by ivf(nli=8)",
+      "v float[8] indexed by ivf(nlist=8x)",
+      "v float[8] indexed by ivf(nlist=8,)",
+      "v float[8] indexed by ivf(quantizer=int8, oversample=99999999999)",
+      "v float[8] indexed by ivf",
+      "v float[8] indexed by ivf(",
+  };
+  for (size_t i = 0; i < countof(errors); i++) {
+    rc = vec0_parse_vector_column(errors[i], (int)strlen(errors[i]), &col,
+                                  true);
+    assert(rc == SQLITE_ERROR);
+  }
+
+  printf("  All vec0_parse_vector_column_ivf tests passed.\n");
+}
+
+void test_ivf_quantize_int8() {
+  printf("Starting %s...\n", __func__);
+
+  // Values in [-1, 1] scale to [-127, 127], truncating toward zero
+  {
+    float src[] = {0.0f, 1.0f, -1.0f, 0.5f};
+    int8_t dst[4];
+    ivf_quantize_int8(src, dst, 4);
+    assert(dst[0] == 0);
+    assert(dst[1] == 127);
+    assert(dst[2] == -127);
+    assert(dst[3] == 63);
+  }
+
+  // Values past [-1, 1] clamp, and NaN is 127
+  {
+    float src[] = {2.0f, -3.0f, 100.0f, -0.01f, NAN, INFINITY, -INFINITY};
+    int8_t dst[7];
+    ivf_quantize_int8(src, dst, 7);
+    assert(dst[0] == 127);
+    assert(dst[1] == -127);
+    assert(dst[2] == 127);
+    assert(dst[3] == (int8_t)(-0.01f * 127.0f));
+    assert(dst[4] == 127);
+    assert(dst[5] == 127);
+    assert(dst[6] == -127);
+  }
+
+  {
+    float src[] = {0.0f, -0.0f, 0.75f};
+    int8_t dst[3];
+    ivf_quantize_int8(src, dst, 3);
+    assert(dst[0] == 0);
+    assert(dst[1] == 0);
+    assert(dst[2] == (int8_t)(0.75f * 127.0f));
+  }
+
+  printf("  All ivf_quantize_int8 tests passed.\n");
+}
+
+void test_ivf_quantize_binary() {
+  printf("Starting %s...\n", __func__);
+
+  // A value above 0 sets its bit, the first value in the lowest bit
+  {
+    float src[] = {1.0f, -1.0f, 0.5f, -0.5f, 0.0f, 0.1f, -0.1f, 2.0f};
+    uint8_t dst[1];
+    ivf_quantize_binary(src, dst, 8);
+    assert(dst[0] == 0xA5);
+  }
+
+  {
+    float src[] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
+    uint8_t dst[1];
+    ivf_quantize_binary(src, dst, 8);
+    assert(dst[0] == 0xFF);
+  }
+
+  {
+    float src[] = {-1.0f, -2.0f, 0.0f, -0.0f, -5.0f, -6.0f, -7.0f, NAN};
+    uint8_t dst[1] = {0xFF};
+    ivf_quantize_binary(src, dst, 8);
+    assert(dst[0] == 0x00);
+  }
+
+  {
+    float src[16];
+    for (int i = 0; i < 16; i++) {
+      src[i] = (i % 2 == 0) ? 1.0f : -1.0f;
+    }
+    uint8_t dst[2];
+    ivf_quantize_binary(src, dst, 16);
+    assert(dst[0] == 0x55);
+    assert(dst[1] == 0x55);
+  }
+
+  printf("  All ivf_quantize_binary tests passed.\n");
+}
+
+void test_ivf_kmeans() {
+  printf("Starting %s...\n", __func__);
+
+  // Three clusters of 2-dimensional points around (0, 0), (10, 0), (0, 10)
+  float vectors[30 * 2];
+  for (int i = 0; i < 30; i++) {
+    float offset = (float)(i % 10) / 10.0f;
+    vectors[i * 2] = (i / 10 == 1 ? 10.0f : 0.0f) + offset;
+    vectors[i * 2 + 1] = (i / 10 == 2 ? 10.0f : 0.0f) - offset;
+  }
+
+  float centroids[3 * 2];
+  assert(ivf_kmeans(vectors, 30, 2, 3, 25, 0, centroids) == SQLITE_OK);
+  int found[3] = {0, 0, 0};
+  for (int c = 0; c < 3; c++) {
+    float x = centroids[c * 2], y = centroids[c * 2 + 1];
+    // each cluster's mean is its corner moved by (0.45, -0.45)
+    if (fabsf(x - 0.45f) < 1e-4 && fabsf(y + 0.45f) < 1e-4) {
+      found[0]++;
+    } else if (fabsf(x - 10.45f) < 1e-4 && fabsf(y + 0.45f) < 1e-4) {
+      found[1]++;
+    } else if (fabsf(x - 0.45f) < 1e-4 && fabsf(y - 9.55f) < 1e-4) {
+      found[2]++;
+    }
+  }
+  assert(found[0] == 1 && found[1] == 1 && found[2] == 1);
+
+  // The same seed gives the same centroids
+  {
+    float a[3 * 2], b[3 * 2];
+    assert(ivf_kmeans(vectors, 30, 2, 3, 25, 7, a) == SQLITE_OK);
+    assert(ivf_kmeans(vectors, 30, 2, 3, 25, 7, b) == SQLITE_OK);
+    assert(memcmp(a, b, sizeof(a)) == 0);
+  }
+
+  // As many centroids as vectors: each vector is one
+  {
+    float few[3 * 2] = {1.0f, 1.0f, 5.0f, 5.0f, 9.0f, 9.0f};
+    float out[3 * 2];
+    assert(ivf_kmeans(few, 3, 2, 3, 25, 0, out) == SQLITE_OK);
+    for (int v = 0; v < 3; v++) {
+      int matches = 0;
+      for (int c = 0; c < 3; c++) {
+        matches += out[c * 2] == few[v * 2] && out[c * 2 + 1] == few[v * 2 + 1];
+      }
+      assert(matches == 1);
+    }
+  }
+
+  // More centroids than vectors, or none
+  assert(ivf_kmeans(vectors, 2, 2, 3, 25, 0, centroids) == SQLITE_MISUSE);
+  assert(ivf_kmeans(vectors, 30, 2, 0, 25, 0, centroids) == SQLITE_MISUSE);
+  assert(ivf_kmeans(vectors, 0, 2, 1, 25, 0, centroids) == SQLITE_MISUSE);
+
+  printf("  All ivf_kmeans tests passed.\n");
+}
+
+#else
+
+void test_vec0_parse_vector_column_ivf() {
+  printf("Starting %s...\n", __func__);
+  struct VectorColumnDefinition col;
+  // a build without the IVF index has no ivf() to parse
+  const char *input = "v float[4] indexed by ivf()";
+  int rc = vec0_parse_vector_column(input, (int)strlen(input), &col, true);
+  assert(rc == SQLITE_ERROR);
+  printf("  All vec0_parse_vector_column_ivf tests passed.\n");
+}
+
+#endif /* SQLITE_VEC_EXPERIMENTAL_IVF_ENABLE */
+
 int main() {
   printf("Starting unit tests...\n");
   test_vec0_token_next();
@@ -1402,6 +1724,12 @@ int main() {
   test_diskann_config_defaults();
   test_diskann_candidate_list_operations();
   test_diskann_visited_set_operations();
+#endif
+  test_vec0_parse_vector_column_ivf();
+#if SQLITE_VEC_EXPERIMENTAL_IVF_ENABLE
+  test_ivf_quantize_int8();
+  test_ivf_quantize_binary();
+  test_ivf_kmeans();
 #endif
   printf("All unit tests passed.\n");
 }

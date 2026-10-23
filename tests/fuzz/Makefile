@@ -124,6 +124,33 @@ $(TARGET_DIR)/diskann_prune_direct: diskann-prune-direct.c $(FUZZ_SRCS) | $(TARG
 $(TARGET_DIR)/diskann_command_inject: diskann-command-inject.c $(FUZZ_SRCS) | $(TARGET_DIR)
 	$(FUZZ_CC) $(FUZZ_CFLAGS) $(FUZZ_SRCS) $< -o $@
 
+# the IVF index is compiled only on request
+IVF_CFLAGS = -DSQLITE_VEC_EXPERIMENTAL_IVF_ENABLE=1
+
+$(TARGET_DIR)/ivf_create: ivf-create.c $(FUZZ_SRCS) | $(TARGET_DIR)
+	$(FUZZ_CC) $(FUZZ_CFLAGS) $(IVF_CFLAGS) $(FUZZ_SRCS) $< -o $@
+
+$(TARGET_DIR)/ivf_operations: ivf-operations.c $(FUZZ_SRCS) | $(TARGET_DIR)
+	$(FUZZ_CC) $(FUZZ_CFLAGS) $(IVF_CFLAGS) $(FUZZ_SRCS) $< -o $@
+
+$(TARGET_DIR)/ivf_quantize: ivf-quantize.c $(FUZZ_SRCS) | $(TARGET_DIR)
+	$(FUZZ_CC) $(FUZZ_CFLAGS) $(IVF_CFLAGS) $(FUZZ_SRCS) $< -o $@
+
+$(TARGET_DIR)/ivf_kmeans: ivf-kmeans.c $(FUZZ_SRCS) | $(TARGET_DIR)
+	$(FUZZ_CC) $(FUZZ_CFLAGS) $(IVF_CFLAGS) $(FUZZ_SRCS) $< -o $@
+
+$(TARGET_DIR)/ivf_shadow_corrupt: ivf-shadow-corrupt.c $(FUZZ_SRCS) | $(TARGET_DIR)
+	$(FUZZ_CC) $(FUZZ_CFLAGS) $(IVF_CFLAGS) $(FUZZ_SRCS) $< -o $@
+
+$(TARGET_DIR)/ivf_knn_deep: ivf-knn-deep.c $(FUZZ_SRCS) | $(TARGET_DIR)
+	$(FUZZ_CC) $(FUZZ_CFLAGS) $(IVF_CFLAGS) $(FUZZ_SRCS) $< -o $@
+
+$(TARGET_DIR)/ivf_cell_overflow: ivf-cell-overflow.c $(FUZZ_SRCS) | $(TARGET_DIR)
+	$(FUZZ_CC) $(FUZZ_CFLAGS) $(IVF_CFLAGS) $(FUZZ_SRCS) $< -o $@
+
+$(TARGET_DIR)/ivf_rescore: ivf-rescore.c $(FUZZ_SRCS) | $(TARGET_DIR)
+	$(FUZZ_CC) $(FUZZ_CFLAGS) $(IVF_CFLAGS) $(FUZZ_SRCS) $< -o $@
+
 FUZZ_TARGETS = vec0_create exec json numpy \
                shadow_corrupt vec0_operations scalar_functions \
                vec0_create_full metadata_columns vec_each vec_mismatch \
@@ -135,7 +162,9 @@ FUZZ_TARGETS = vec0_create exec json numpy \
                diskann_deep_search diskann_blob_truncate \
                diskann_delete_stress diskann_buffer_flush \
                diskann_int8_quant diskann_prune_direct \
-               diskann_command_inject
+               diskann_command_inject \
+               ivf_create ivf_operations ivf_quantize ivf_kmeans \
+               ivf_shadow_corrupt ivf_knn_deep ivf_cell_overflow ivf_rescore
 
 all: $(addprefix $(TARGET_DIR)/,$(FUZZ_TARGETS))
 

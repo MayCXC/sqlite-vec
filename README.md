@@ -295,8 +295,9 @@ VACUUM;
 `VACUUM` should not corrupt vec tables; a checkpoint first is recommended when
 using WAL so the rewrite starts from a clean state.
 
-`optimize`, like the `oversample=N` command of a rescore index and the
-`search_list_size=N` commands of a DiskANN index, runs through a hidden column
+`optimize`, like the `oversample=N` command of a rescore index, the
+`search_list_size=N` commands of a DiskANN index and the commands of an IVF
+index, runs through a hidden column
 named after the table, so a `vec0` table cannot have another column with its
 name. `CREATE` rejects tables such as
 `CREATE VIRTUAL TABLE emb USING vec0(emb float[4])`, and tables named
@@ -436,6 +437,91 @@ where sample_embedding match '[0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]'
   chosen for the vector it has; delete the row and insert it again.
 - A `DELETE` links the row's neighbors to each other and reads every node of
   the graph to remove the links to the row.
+
+### IVF Index (experimental)
+
+A build compiled with `-DSQLITE_VEC_EXPERIMENTAL_IVF_ENABLE=1`, as by
+`make loadable CPPFLAGS=-DSQLITE_VEC_EXPERIMENTAL_IVF_ENABLE=1`, has one more
+index; the prebuilt binaries leave it out. A `float` vector column declared
+`indexed by ivf()` clusters its rows around `nlist` centroids with k-means, and
+a KNN query reads only the rows of the `nprobe` centroids nearest its vector.
+Rows wait in cells of no centroid until `compute-centroids` clusters them, and
+a query reads those cells in full, so until then it answers as a flat column
+does:
+
+```sql
+create virtual table vec_ivf using vec0(
+  sample_embedding float[8] indexed by ivf(nlist=4, nprobe=1)
+);
+insert into vec_ivf(rowid, sample_embedding)
+  select rowid, sample_embedding from vec_examples;
+insert into vec_ivf(vec_ivf) values ('compute-centroids');
+
+select rowid, distance
+from vec_ivf
+where sample_embedding match '[0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]'
+  and k = 3;
+/*
+┌───────┬──────────────────┐
+│ rowid │     distance     │
+├───────┼──────────────────┤
+│ 5     │ 1.16368770599365 │
+│ 7     │ 1.89339029788971 │
+│ 4     │ 2.10507702827454 │
+└───────┴──────────────────┘
+*/
+```
+
+The query read one of the four clusters, and rows 13 and 11, the second and
+third nearest, are in others. The `nprobe=N` command sets `nprobe` for every
+IVF column, for the connection that runs it:
+
+```sql
+insert into vec_ivf(vec_ivf) values ('nprobe=2');
+
+select rowid, distance
+from vec_ivf
+where sample_embedding match '[0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]'
+  and k = 3;
+/*
+┌───────┬──────────────────┐
+│ rowid │     distance     │
+├───────┼──────────────────┤
+│ 5     │ 1.16368770599365 │
+│ 13    │ 1.75137972831726 │
+│ 11    │ 1.83941268920898 │
+└───────┴──────────────────┘
+*/
+```
+
+- `nlist` is 128 unless the column sets it, up to 65536, and `nlist=0` leaves
+  the centroids to `set-centroid`. `nprobe` is 10, or `nlist` if that is less.
+- `compute-centroids` clusters every row of each IVF column, with at most one
+  centroid per row, and moves each row to the cells of its nearest centroid.
+  `compute-centroids:{"nlist": 64, "max_iterations": 25, "seed": 1}` sets any
+  of the three as JSON integers; the same rows, read in the same order, and the
+  same seed give the same centroids. A row inserted later goes to the cells of
+  its nearest centroid, and the centroids stay as they are until the next
+  `compute-centroids`.
+- `set-centroid:N` sets centroid `N` of each IVF column to the vector the same
+  `INSERT` gives it, as in
+  `insert into vec_ivf(vec_ivf, sample_embedding) values ('set-centroid:0', '[...]')`.
+  `assign-vectors` then moves the rows in cells of no centroid to their nearest
+  centroids, and `clear-centroids` removes the centroids and moves every row to
+  cells of no centroid. Every command applies to each IVF column of the table.
+- With `quantizer=int8` or `quantizer=binary`, the cells and centroids hold the
+  vectors quantized and the `float` vectors are kept by rowid besides. A query
+  keeps the `k * oversample` rows nearest by quantized distance and ranks them
+  by their exact distances. `int8` maps [-1, 1] onto [-127, 127]; `binary` keeps
+  a bit for each value > 0 and needs a number of dimensions divisible by 8.
+  `oversample` is 1 unless the column sets it, and needs a quantizer.
+- With `rowid = ?` or `rowid in (...)`, a KNN query ranks the rows they name by
+  their exact distances, without the clusters. Distance constraints apply to
+  the exact distances of the rows the query read, and MMR reranks them as it
+  does any KNN query.
+- A table with an IVF column cannot have metadata or partition key columns, and
+  only `float` columns can be indexed by IVF. Auxiliary columns work.
+- `UPDATE` of an IVF column's vector fails; delete the row and insert it again.
 
 ## Sponsors
 

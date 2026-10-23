@@ -81,6 +81,49 @@ A table whose every vector column is indexed by `diskann()` keeps no chunks:
 its `xyz_chunks` stays empty, and its `xyz_rowids` rows have no `chunk_id` or
 `chunk_offset`.
 
+#### `xyz_ivf_centroidsNN`
+
+The centroids of a column indexed by `ivf()`, held as its cells hold vectors:
+`float32`, or quantized by the column's `quantizer`. The `ivf_trained_N` row of
+`xyz_info` is 1 while the column has centroids.
+
+- `centroid_id INTEGER`
+- `centroid BLOB`
+
+#### `xyz_ivf_cellsNN`
+
+The rows of a column indexed by `ivf()`, in cells of up to 64. A cell holds
+rows of one centroid, or, with `centroid_id` -1, rows no clustering has placed.
+`validity` holds a bit per slot, set when the slot holds a row, `rowids` the
+row's rowid as a 64-bit integer in the machine's byte order, and `vectors` its
+vector as the centroids hold them. `n_vectors` counts the set bits. A query
+finds the cells of a centroid through the index of the
+`UNIQUE (centroid_id, cell_id)` constraint.
+
+- `cell_id INTEGER`
+- `centroid_id INTEGER`
+- `n_vectors INTEGER`
+- `validity BLOB`
+- `rowids BLOB`
+- `vectors BLOB`
+
+#### `xyz_ivf_rowid_mapNN`
+
+The cell and slot of each row of a column indexed by `ivf()`.
+
+- `rowid INTEGER`
+- `cell_id INTEGER`
+- `slot INTEGER`
+
+#### `xyz_ivf_vectorsNN`
+
+The `float32` vectors of a column indexed by `ivf()` with a `quantizer`, one
+row per row of the table. Without a quantizer, the cells hold the vectors and
+the table does not exist.
+
+- `rowid INTEGER`
+- `vector BLOB`
+
 #### `xyz_auxiliary`
 
 - `rowid INTEGER`
@@ -103,11 +146,14 @@ The supported way to tell which tables belong to a `vec0` table is by name. A
 
 - `xyz_info`, `xyz_chunks`, `xyz_rowids`: always
 - `xyz_vector_chunksNN`: one per vector column, except those indexed by
-  `rescore()` or `diskann()`
+  `rescore()`, `diskann()` or `ivf()`
 - `xyz_rescore_chunksNN`, `xyz_rescore_vectorsNN`: one each per vector column
   indexed by `rescore()`
 - `xyz_vectorsNN`, `xyz_diskann_nodesNN`, `xyz_diskann_bufferNN`: one each per
   vector column indexed by `diskann()`
+- `xyz_ivf_centroidsNN`, `xyz_ivf_cellsNN`, `xyz_ivf_rowid_mapNN`: one each per
+  vector column indexed by `ivf()`, and `xyz_ivf_vectorsNN` for each of those
+  with a `quantizer`
 - `xyz_auxiliary`: only if there are auxiliary columns
 - `xyz_metadatachunksNN`: one per metadata column
 - `xyz_metadatatextNN`: one per text metadata column
@@ -129,6 +175,10 @@ join sqlite_master as s
    or substr(s.name, length(v.name) + 2) glob 'vectors[0-9][0-9]'
    or substr(s.name, length(v.name) + 2) glob 'diskann_nodes[0-9][0-9]'
    or substr(s.name, length(v.name) + 2) glob 'diskann_buffer[0-9][0-9]'
+   or substr(s.name, length(v.name) + 2) glob 'ivf_centroids[0-9][0-9]'
+   or substr(s.name, length(v.name) + 2) glob 'ivf_cells[0-9][0-9]'
+   or substr(s.name, length(v.name) + 2) glob 'ivf_rowid_map[0-9][0-9]'
+   or substr(s.name, length(v.name) + 2) glob 'ivf_vectors[0-9][0-9]'
    or substr(s.name, length(v.name) + 2) glob 'metadatachunks[0-9][0-9]'
    or substr(s.name, length(v.name) + 2) glob 'metadatatext[0-9][0-9]')
 where v.type = 'table' and v.rootpage = 0
@@ -146,7 +196,7 @@ relied on:
 - Before SQLite 3.37 there is no `PRAGMA table_list` and no prefix marking (see
   below), so the tables whose suffix has an underscore (`vector_chunksNN`,
   `rescore_chunksNN`, `rescore_vectorsNN`, `diskann_nodesNN`,
-  `diskann_bufferNN`) are never shadow tables.
+  `diskann_bufferNN`, and the four `ivf_` tables) are never shadow tables.
 - SQLite finds the virtual table that owns a newly created or newly parsed
   table by splitting its name at the **last** underscore
   ([documented](https://www.sqlite.org/vtab.html#the_xshadowname_method)). For
