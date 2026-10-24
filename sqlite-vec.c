@@ -10823,8 +10823,10 @@ cleanup:
   return rc;
 }
 
+// Clears the row's validity bit, and sets *chunkEmpty to whether that was the
+// chunk's last set bit.
 int vec0Update_Delete_ClearValidity(vec0_vtab *p, i64 chunk_id,
-                                    u64 chunk_offset) {
+                                    u64 chunk_offset, int *chunkEmpty) {
   int rc, brc;
   sqlite3_blob *blobChunksValidity = NULL;
   char unsigned bx;
@@ -10868,6 +10870,26 @@ int vec0Update_Delete_ClearValidity(vec0_vtab *p, i64 chunk_id,
         &p->base, "could not write to validity blob for %s.%s.%lld at %d",
         p->schemaName, p->shadowChunksName, chunk_id, validityOffset);
     goto cleanup;
+  }
+
+  // Another set bit in this byte keeps the chunk, as it does for most deletes,
+  // so the rest of the bitmap is read only once this byte is zero.
+  *chunkEmpty = 0;
+  if (result == 0) {
+    int validitySize = sqlite3_blob_bytes(blobChunksValidity);
+    u8 *validity = sqlite3_malloc(validitySize);
+    if (!validity) {
+      rc = SQLITE_NOMEM;
+      goto cleanup;
+    }
+    rc = sqlite3_blob_read(blobChunksValidity, validity, validitySize, 0);
+    if (rc == SQLITE_OK) {
+      *chunkEmpty = !bitmap_any(validity, validitySize * CHAR_BIT);
+    } else {
+      vtab_set_error(&p->base, "could not read validity blob for %s.%s.%lld",
+                     p->schemaName, p->shadowChunksName, chunk_id);
+    }
+    sqlite3_free(validity);
   }
 
 cleanup:
@@ -11127,44 +11149,10 @@ done:
 // chunk's rows from _chunks, _vector_chunksNN and _metadatachunksNN, so their
 // pages are free without an optimize.
 // https://github.com/asg017/sqlite-vec/commit/cb147c8
-int vec0Update_Delete_DeleteChunkIfEmpty(vec0_vtab *p, i64 chunk_id) {
+int vec0Update_Delete_DeleteChunk(vec0_vtab *p, i64 chunk_id) {
   int rc;
-  sqlite3_blob *blobValidity = NULL;
   sqlite3_stmt *stmt = NULL;
   char *zSql;
-
-  rc = sqlite3_blob_open(p->db, p->schemaName, p->shadowChunksName, "validity",
-                         chunk_id, 0, &blobValidity);
-  if (rc != SQLITE_OK) {
-    vtab_set_error(&p->base, "could not open validity blob for %s.%s.%lld",
-                   p->schemaName, p->shadowChunksName, chunk_id);
-    return vec0_error_rc(rc);
-  }
-  int validitySize = sqlite3_blob_bytes(blobValidity);
-  u8 *validity = sqlite3_malloc(validitySize);
-  if (!validity) {
-    sqlite3_blob_close(blobValidity);
-    return SQLITE_NOMEM;
-  }
-  rc = sqlite3_blob_read(blobValidity, validity, validitySize, 0);
-  int brc = sqlite3_blob_close(blobValidity);
-  if (rc != SQLITE_OK) {
-    sqlite3_free(validity);
-    vtab_set_error(&p->base, "could not read validity blob for %s.%s.%lld",
-                   p->schemaName, p->shadowChunksName, chunk_id);
-    return rc;
-  }
-  if (brc != SQLITE_OK) {
-    sqlite3_free(validity);
-    vtab_set_error(&p->base, "could not close validity blob for %s.%s.%lld",
-                   p->schemaName, p->shadowChunksName, chunk_id);
-    return brc;
-  }
-  int empty = !bitmap_any(validity, validitySize * CHAR_BIT);
-  sqlite3_free(validity);
-  if (!empty) {
-    return SQLITE_OK;
-  }
 
   zSql = sqlite3_mprintf("DELETE FROM " VEC0_SHADOW_CHUNKS_NAME
                          " WHERE chunk_id = ?",
@@ -11255,7 +11243,8 @@ int vec0Update_Delete(sqlite3_vtab *pVTab, sqlite3_value *idValue) {
     return rc;
   }
 
-  rc = vec0Update_Delete_ClearValidity(p, chunk_id, chunk_offset);
+  int chunkEmpty;
+  rc = vec0Update_Delete_ClearValidity(p, chunk_id, chunk_offset, &chunkEmpty);
   if (rc != SQLITE_OK) {
     return rc;
   }
@@ -11297,7 +11286,10 @@ int vec0Update_Delete(sqlite3_vtab *pVTab, sqlite3_value *idValue) {
   }
 
   // 8. delete the chunk if that was its last row
-  return vec0Update_Delete_DeleteChunkIfEmpty(p, chunk_id);
+  if (chunkEmpty) {
+    return vec0Update_Delete_DeleteChunk(p, chunk_id);
+  }
+  return SQLITE_OK;
 }
 
 int vec0Update_UpdateAuxColumn(vec0_vtab *p, int auxiliary_column_idx,
