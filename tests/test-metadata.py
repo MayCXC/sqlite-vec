@@ -1842,3 +1842,35 @@ def vec0_shadow_table_contents(db, v):
             continue
         o[shadow_table] = exec(db, f"select * from {shadow_table}")
     return o
+
+
+@pytest.mark.parametrize("encoding", ["UTF-8", "UTF-16le", "UTF-16be"])
+def test_knn_like_escape_prefix_with_limit(encoding):
+    # For a LIKE ... ESCAPE pattern that begins with literal text SQLite passes
+    # vec0 range conditions that select the same rows, so the query works with
+    # LIMIT, except in a UTF-16le database, where it needs k = ?.
+    db = sqlite3.connect(":memory:")
+    db.enable_load_extension(True)
+    db.load_extension(get_extension_path())
+    db.enable_load_extension(False)
+    db.execute(f"pragma encoding = '{encoding}'")
+    db.execute(
+        "create virtual table v using vec0(p text partition key, t text, e float[1])"
+    )
+    db.execute("create table plain(id integer primary key, p text, t text)")
+    for i, value in enumerate(["aA", "a_b", "A_B"], 1):
+        db.execute(
+            "insert into v(rowid, p, t, e) values (?, ?, ?, ?)",
+            [i, value, value, f"[{i}]"],
+        )
+        db.execute("insert into plain values (?, ?, ?)", [i, value, value])
+    for column in ["p", "t"]:
+        where = f"{column} like 'a!_%' escape '!'"
+        want = [r[0] for r in db.execute(f"select id from plain where {where}")]
+        query = f"select rowid from v where e match '[0]' and {where}"
+        assert [r[0] for r in db.execute(query + " and k = 3")] == want
+        if encoding == "UTF-16le":
+            with pytest.raises(sqlite3.OperationalError, match="LIMIT or 'k = \\?'"):
+                db.execute(query + " limit 3").fetchall()
+        else:
+            assert [r[0] for r in db.execute(query + " limit 3")] == want

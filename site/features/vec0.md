@@ -140,7 +140,7 @@ queries.` These conditions include:
 - `LIKE ... ESCAPE`. For some patterns that begin with literal text, such as
   `'sci!_fi%' escape '!'`, SQLite instead passes `vec0` range conditions that
   select the same rows, so the query returns up to `k` matching rows and works
-  with `LIMIT`.
+  with `LIMIT`, except in a UTF-16le database, where it needs `k = ?`.
 - `!=` and `IS NOT` with `COLLATE` on the column, as in
   `genre collate nocase != 'scifi'`
 - `IS TRUE`, `IS FALSE`, and a boolean column on its own, as in
@@ -205,7 +205,7 @@ conditions include:
 - `LIKE ... ESCAPE`. For some patterns that begin with literal text, such as
   `'a!_%' escape '!'`, SQLite instead passes `vec0` range conditions that
   select the same rows, so the query returns up to `k` matching rows and works
-  with `LIMIT`.
+  with `LIMIT`, except in a UTF-16le database, where it needs `k = ?`.
 - `IS TRUE`, `IS FALSE`, `IS NOT TRUE`, and `IS NOT FALSE`
 - conditions joined with `OR`, except `=` conditions on one column, which
   SQLite turns into `IN`
