@@ -54,6 +54,12 @@ typedef size_t usize;
 #define COMPILER_SUPPORTS_VTAB_IN 1
 #endif
 
+// sqlite3_value_encoding() was added in SQLite version 3.41 (2023-02-21)
+// https://www.sqlite.org/changes.html#version_3_41_0
+#if SQLITE_VERSION_NUMBER >= 3041000
+#define COMPILER_SUPPORTS_VALUE_ENCODING 1
+#endif
+
 #ifndef SQLITE_SUBTYPE
 #define SQLITE_SUBTYPE 0x000100000
 #endif
@@ -5376,14 +5382,34 @@ void vec0_cursor_clear(vec0_cursor *pCur) {
 
 // Reads the database's text encoding into *pEncoding: SQLITE_UTF8,
 // SQLITE_UTF16LE or SQLITE_UTF16BE. Every attached database shares the main
-// database's encoding. PRAGMA encoding names it "UTF-8", "UTF-16le" or
-// "UTF-16be", and a build with SQLITE_OMIT_UTF16 has no such pragma, so it
-// returns no row there, where every database is UTF-8 (PragTyp_ENCODING in
-// https://sqlite.org/src/file/src/pragma.c and sqlite3InitOne() in
-// https://sqlite.org/src/file/src/prepare.c).
+// database's encoding. SQLite converts a string literal to the database's
+// encoding when it runs the statement, so on SQLite 3.41+
+// sqlite3_value_encoding() of one reports it without a PRAGMA, which an
+// application's authorizer may deny. Older SQLite reads PRAGMA encoding, which
+// names it "UTF-8", "UTF-16le" or "UTF-16be". A build with SQLITE_OMIT_UTF16
+// has no such pragma, so it returns no row there, where every database is UTF-8
+// (PragTyp_ENCODING in https://sqlite.org/src/file/src/pragma.c and
+// sqlite3InitOne() in https://sqlite.org/src/file/src/prepare.c); an authorizer
+// that ignores the pragma also returns no row, so in any other build that is
+// SQLITE_EMPTY.
 static int vec0_read_text_encoding(sqlite3 *db, int *pEncoding) {
   sqlite3_stmt *stmt = NULL;
-  int rc = sqlite3_prepare_v2(db, "PRAGMA encoding", -1, &stmt, NULL);
+  int rc;
+#if COMPILER_SUPPORTS_VALUE_ENCODING
+  if (sqlite3_libversion_number() >= 3041000) {
+    rc = sqlite3_prepare_v2(db, "SELECT 'a'", -1, &stmt, NULL);
+    if (rc == SQLITE_OK) {
+      rc = sqlite3_step(stmt);
+      if (rc == SQLITE_ROW) {
+        *pEncoding = sqlite3_value_encoding(sqlite3_column_value(stmt, 0));
+        rc = SQLITE_OK;
+      }
+    }
+    sqlite3_finalize(stmt);
+    return rc;
+  }
+#endif
+  rc = sqlite3_prepare_v2(db, "PRAGMA encoding", -1, &stmt, NULL);
   if (rc != SQLITE_OK) {
     return rc;
   }
@@ -5402,7 +5428,15 @@ static int vec0_read_text_encoding(sqlite3 *db, int *pEncoding) {
       rc = SQLITE_OK;
     }
   } else if (rc == SQLITE_DONE) {
-    rc = SQLITE_OK;
+    // A host built with SQLITE_OMIT_COMPILEOPTION_DIAGS gives an extension no
+    // sqlite3_compileoption_used(), so it cannot confirm SQLITE_OMIT_UTF16
+#ifndef SQLITE_CORE
+    int canAsk = sqlite3_api->compileoption_used != NULL;
+#else
+    int canAsk = 1;
+#endif
+    rc = canAsk && sqlite3_compileoption_used("OMIT_UTF16") ? SQLITE_OK
+                                                            : SQLITE_EMPTY;
   }
   sqlite3_finalize(stmt);
   return rc;
@@ -5428,7 +5462,8 @@ static int vec0_init(sqlite3 *db, void *pAux, int argc, const char *const *argv,
       *pzErr =
           sqlite3_mprintf(VEC_CONSTRUCTOR_ERROR
                           "could not read the database's text encoding: %s",
-                          sqlite3_errmsg(db));
+                          rc == SQLITE_EMPTY ? "PRAGMA encoding returned no row"
+                                             : sqlite3_errmsg(db));
     }
     return vec0_error_rc(rc);
   }

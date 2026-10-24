@@ -1700,10 +1700,12 @@ def test_knn_text_filters_in_utf16_database(encoding):
     assert mismatches == []
 
 
-def test_knn_fails_to_open_when_encoding_is_unreadable(tmp_path):
-    # vec0 reads the database's text encoding with PRAGMA encoding when it
-    # opens a table, so a connection whose authorizer denies the pragma fails
-    # to open it instead of comparing text in a guessed encoding.
+def test_knn_text_filters_when_the_authorizer_denies_pragmas(tmp_path):
+    # vec0 reads the database's text encoding when it opens a table. SQLite
+    # 3.41+ needs no PRAGMA for that, so a connection whose authorizer denies
+    # PRAGMAs opens the table and keeps its text range filters, as main did;
+    # older SQLite reads PRAGMA encoding, so the table fails to open instead of
+    # comparing text in a guessed encoding.
     path = str(tmp_path / "encoding.db")
     db = sqlite3.connect(path)
     db.enable_load_extension(True)
@@ -1725,13 +1727,37 @@ def test_knn_fails_to_open_when_encoding_is_unreadable(tmp_path):
             else sqlite3.SQLITE_OK
         )
     )
+    query = "select rowid from v where vector match '[0]' and t > 'm'"
+    if sqlite3.sqlite_version_info >= (3, 41, 0):
+        assert [r[0] for r in db.execute(query + " and k = 1")] == [2]
+        assert [r[0] for r in db.execute(query + " limit 1")] == [2]
+    else:
+        with pytest.raises(
+            sqlite3.OperationalError,
+            match="could not read the database's text encoding: not authorized",
+        ):
+            db.execute(query + " and k = 1").fetchall()
+
+
+@pytest.mark.skipif(
+    sqlite3.sqlite_version_info < (3, 41, 0),
+    reason="older SQLite reads the encoding with PRAGMA encoding",
+)
+def test_vec0_create_fails_when_the_encoding_cannot_be_read():
+    db = sqlite3.connect(":memory:")
+    db.enable_load_extension(True)
+    db.load_extension(get_extension_path())
+    db.set_authorizer(
+        lambda action, *_: (
+            sqlite3.SQLITE_DENY
+            if action == sqlite3.SQLITE_SELECT
+            else sqlite3.SQLITE_OK
+        )
+    )
     with pytest.raises(
-        sqlite3.OperationalError,
-        match="could not read the database's text encoding: not authorized",
+        sqlite3.OperationalError, match="could not read the database's text encoding"
     ):
-        db.execute(
-            "select rowid from v where vector match '[0]' and k = 1 and t > 'm'"
-        ).fetchall()
+        db.execute("create virtual table v using vec0(e float[1], t text)")
 
 
 def test_knn_text_filter_null_long_value(db):

@@ -308,8 +308,10 @@ row with the query's collation.
 `vec0` keeps text metadata as UTF-8, while SQLite orders text under `BINARY` by
 the bytes of the database's encoding, and UTF-16 orders some characters
 differently (SQLite registers `BINARY` in each encoding and `NOCASE` and
-`RTRIM` for UTF-8 only). So `vec0_init()` reads the encoding with
-`PRAGMA encoding` into `textEncoding`, and in a UTF-16 database
+`RTRIM` for UTF-8 only). So `vec0_init()` reads the encoding into
+`textEncoding`, from `sqlite3_value_encoding()` of a string literal on SQLite
+3.41 and later and with `PRAGMA encoding` before that (no row means UTF-8 only
+in a build without UTF-16, `SQLITE_OMIT_UTF16`), and in a UTF-16 database
 `vec0_text_cmp()` compares under `BINARY` by the bytes SQLite stores for each
 value, converting its UTF-8 as SQLite's `utf.c` does.
 
