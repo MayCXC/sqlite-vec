@@ -71,10 +71,17 @@ enum Vec0DistanceMetrics {
 #define SQLITE_VEC_ENABLE_DISKANN 1
 #endif
 
+#ifndef SQLITE_VEC_EXPERIMENTAL_IVF_ENABLE
+#define SQLITE_VEC_EXPERIMENTAL_IVF_ENABLE 0
+#endif
+
 enum Vec0IndexType {
   VEC0_INDEX_TYPE_FLAT = 1,
 #if SQLITE_VEC_ENABLE_RESCORE
   VEC0_INDEX_TYPE_RESCORE = 2,
+#endif
+#if SQLITE_VEC_EXPERIMENTAL_IVF_ENABLE
+  VEC0_INDEX_TYPE_IVF = 3,
 #endif
 #if SQLITE_VEC_ENABLE_DISKANN
   VEC0_INDEX_TYPE_DISKANN = 4,
@@ -111,6 +118,21 @@ struct Vec0DiskannConfig {
 };
 #endif
 
+#if SQLITE_VEC_EXPERIMENTAL_IVF_ENABLE
+enum Vec0IvfQuantizer {
+  VEC0_IVF_QUANTIZER_NONE = 0,
+  VEC0_IVF_QUANTIZER_INT8 = 1,
+  VEC0_IVF_QUANTIZER_BINARY = 2,
+};
+
+struct Vec0IvfConfig {
+  int nlist;
+  int nprobe;
+  enum Vec0IvfQuantizer quantizer;
+  int oversample;
+};
+#endif
+
 struct VectorColumnDefinition {
   char *name;
   int name_length;
@@ -123,6 +145,9 @@ struct VectorColumnDefinition {
 #endif
 #if SQLITE_VEC_ENABLE_DISKANN
   struct Vec0DiskannConfig diskann;
+#endif
+#if SQLITE_VEC_EXPERIMENTAL_IVF_ENABLE
+  struct Vec0IvfConfig ivf;
 #endif
 };
 
@@ -222,6 +247,13 @@ int diskann_visited_set_contains(const struct DiskannVisitedSet *set,
                                  long long rowid);
 int diskann_visited_set_insert(struct DiskannVisitedSet *set, long long rowid,
                                int *outAdded);
+#endif
+
+#if SQLITE_VEC_EXPERIMENTAL_IVF_ENABLE
+void ivf_quantize_int8(const float *src, int8_t *dst, size_t dimensions);
+void ivf_quantize_binary(const float *src, uint8_t *dst, size_t dimensions);
+int ivf_kmeans(const float *vectors, int n, size_t dimensions, int k,
+               int max_iter, uint32_t seed, float *out_centroids);
 #endif
 
 #endif /* SQLITE_VEC_INTERNAL_H */
